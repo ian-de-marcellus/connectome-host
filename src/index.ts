@@ -219,7 +219,11 @@ export async function createFramework(
   // -- Build module list --
   // SettingsModule is constructed in main() (before the adapter, so the
   // adapter can read its state for cross-cutting concerns like reasoning).
-  const moduleInstances: Module[] = [new TuiModule(), new TimeModule(timeZone), settingsModule];
+  const moduleInstances: Module[] = [
+    new TuiModule(),
+    new TimeModule(timeZone, { announceSessionStart: recipe.agent.announceSessionStart ?? true }),
+    settingsModule,
+  ];
 
   if (modules.scheduledWake) {
     const scheduledWakeConfig = typeof modules.scheduledWake === 'object' ? modules.scheduledWake : {};

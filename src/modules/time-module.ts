@@ -42,9 +42,11 @@ export class TimeModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private readonly timeZone: string;
+  private readonly announceSessionStart: boolean;
 
-  constructor(timeZone?: string) {
+  constructor(timeZone?: string, options: { announceSessionStart?: boolean } = {}) {
     this.timeZone = resolveTimeZone(timeZone);
+    this.announceSessionStart = options.announceSessionStart ?? true;
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -52,6 +54,11 @@ export class TimeModule implements Module {
 
     const state = ctx.getState<TimeState>() ?? {};
     if (state.sessionStartAnnounced) return;
+
+    if (!this.announceSessionStart) {
+      ctx.setState<TimeState>({ ...state, sessionStartAnnounced: true });
+      return;
+    }
 
     const now = formatNow(new Date(), this.timeZone);
     const text =

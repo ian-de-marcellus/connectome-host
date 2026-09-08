@@ -368,6 +368,10 @@ export interface RecipeAgent {
   /** Sticky speaking room: ordinary speech lands in the resident's chosen
    *  room every turn; only its own channel_focus/channel_open moves it. */
   speakingRoom?: { initialChannel: string };
+  /** Post the synthetic "session started" time message on first wake
+   *  (default true). Residents whose history already establishes the present
+   *  can turn it off. */
+  announceSessionStart?: boolean;
 }
 
 export interface RecipeMcpServer {
@@ -1470,6 +1474,9 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.proseDelivery must be 'live' or 'terminal', got ${JSON.stringify(agent.proseDelivery)}.`);
   }
 
+  if (agent.announceSessionStart !== undefined && typeof agent.announceSessionStart !== 'boolean') {
+    throw new Error('Recipe agent.announceSessionStart must be a boolean.');
+  }
   if (agent.speakingRoom !== undefined) {
     const room = agent.speakingRoom as { initialChannel?: unknown } | null;
     if (!room || typeof room !== 'object' || typeof room.initialChannel !== 'string' || !room.initialChannel.trim()) {
