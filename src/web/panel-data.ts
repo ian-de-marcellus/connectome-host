@@ -1177,6 +1177,8 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   const sumById = new Map(sums.map((x) => [x.id, x]));
   const headOf = (txt: string): string => txt.replace(/\s+/g, ' ').slice(0, 100);
   const byHead = new Map(sums.map((x) => [headOf(x.content), x]));
+  const norm = (txt: string): string => txt.replace(/\s+/g, ' ').trim();
+  const byFull = new Map(sums.map((x) => [norm(x.content), x]));
   const leaves = (x: Summary, seen = new Set<string>()): string[] => {
     if (seen.has(x.id)) return [];
     seen.add(x.id);
@@ -1199,13 +1201,12 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     const rendered = Math.ceil(text.length / 4) + nImages * 1600 +
       blocks.filter((b) => b?.type === 'tool_result' || b?.type === 'tool_use')
         .reduce((a, b) => a + Math.ceil(JSON.stringify(b.input ?? b.content ?? '').length / 4), 0);
-    // Identify a summary by its recall header (the entry just before the
-    // answer, rendered from recallHeaderTemplate, e.g. "[Recall L1-99]").
     // compile() drops entry provenance, and matching by the first 100 chars
-    // mislabels summaries that open identically (observed: 22 L1s sharing
-    // one opening), so text matching is only the fallback.
+    // mislabels summaries that open identically (observed: 22 L1s sharing one
+    // opening). Match the full text first, then an id-bearing recall header
+    // ("[Recall L1-99]" / "[CM] Recall memory L1-99."), then the opening.
     const headerId = prevText.trim().match(/^(?:\[Recall (L\d+-\d+)\]|\[CM\] Recall memory (L\d+-\d+)\.)$/)?.slice(1).find(Boolean);
-    const sum = (headerId ? sumById.get(headerId) : undefined) ?? byHead.get(headOf(text));
+    const sum = byFull.get(norm(text)) ?? (headerId ? sumById.get(headerId) : undefined) ?? byHead.get(headOf(text));
     prevText = text;
     if (sum) {
       const leafIds = leaves(sum).filter((id) => msgById.has(id));
