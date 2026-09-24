@@ -154,6 +154,43 @@ describe('SubagentModule reaper — F3 request-in-flight protection', () => {
     expect(entry.status).toBe('cancelled');
   });
 
+  test('reaper hands a reclaimed slot to the oldest queued task without double-release', async () => {
+    const now = Date.now();
+    const mod = new SubagentModule({ maxConcurrent: 1 });
+    const privateView = mod as unknown as {
+      acquireSlot: (onQueued?: (position: number) => void) => Promise<{ waitedMs: number }>;
+      releaseSlot: (ownerName: string) => void;
+      reclaimZombieSlots: () => number;
+      activeConcurrent: number;
+      waitQueue: Array<() => void>;
+    };
+
+    await privateView.acquireSlot();
+    const { entry } = installSubagent(mod, {
+      displayName: 'stale-holder',
+      startedAt: now - 10 * 60_000,
+      lastActivityAt: now,
+    });
+
+    let position = 0;
+    const successor = privateView.acquireSlot((queuedAt) => { position = queuedAt; });
+    expect(position).toBe(1);
+    expect(privateView.waitQueue.length).toBe(1);
+
+    entry.lastActivityAt = now - 5 * 60_000;
+    expect(privateView.reclaimZombieSlots()).toBe(1);
+    await expect(successor).resolves.toMatchObject({ waitedMs: expect.any(Number) });
+    expect(privateView.activeConcurrent).toBe(1);
+    expect(privateView.waitQueue.length).toBe(0);
+
+    // Simulate the stale run's finally block: it must not release the
+    // successor's newly assigned permit.
+    privateView.releaseSlot('stale-holder');
+    expect(privateView.activeConcurrent).toBe(1);
+    privateView.releaseSlot('successor');
+    expect(privateView.activeConcurrent).toBe(0);
+  });
+
   test('peek.isZombie also respects requestInFlightSince', async () => {
     // The peek surface drives the orchestrator's perception. Postmortem F2 was
     // about dual clocks; F3 is the same shape: a healthy in-flight agent must

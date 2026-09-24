@@ -12,7 +12,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, chmodSync } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 
 // ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ export interface RecipeAgent {
    */
   sameRoundThinkTextPolicy?: 'public' | 'private';
   /**
-   * Prose delivery mode (agent-framework docs/explicit-prose-routing.md).
+   * Prose destination routing (agent-framework docs/explicit-prose-routing.md).
    * 'explicit' = model prefixes plain text with `>>destination`; unprefixed
    * prose bounces to a clipboard instead of auto-routing.
    * 'hybrid' = unprefixed prose keeps the current locus while an exact leading
@@ -289,6 +289,13 @@ export interface RecipeAgent {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Default-off containment of whole-response prose wrappers for known tools. */
   toolWrapperProseGuard?: boolean;
+  /**
+   * When ordinary prose reaches channel surfaces. 'live' (default) streams
+   * and publishes each tool round as it yields. 'terminal' retains those
+   * intermediate words in Chronicle and publishes only settled final prose.
+   * Explicit send/publish tools are unaffected.
+   */
+  proseDelivery?: 'live' | 'terminal';
   /**
    * Extra Anthropic beta flags sent as the `anthropic-beta` header on every
    * request (e.g. `["context-1m-2025-08-07"]` for the 1M context window on
@@ -358,6 +365,9 @@ export interface RecipeAgent {
     /** Cooling-off floor before confirmation can bind (default 60 seconds). */
     confirmationDelayMs?: number;
   };
+  /** Sticky speaking room: ordinary speech lands in the resident's chosen
+   *  room every turn; only its own channel_focus/channel_open moves it. */
+  speakingRoom?: { initialChannel: string };
 }
 
 export interface RecipeMcpServer {
@@ -405,6 +415,17 @@ export interface RecipeMcpServer {
   reconnectIntervalMs?: number;
   /** Ceiling for the exponential reconnect backoff. Default: 5 minutes. */
   reconnectMaxIntervalMs?: number;
+  /** Host-owned authority for the broad MCPL host/command administration
+   * surface. It is deliberately not grantable by the server itself. */
+  allowHostCommands?: boolean;
+  /** Least-authority alternative: permit only a fixed-model, no-tools image
+   * reader. Model and ceilings are operator configuration, not request data. */
+  hostImageTriage?: {
+    model: string;
+    maxTokens?: number;
+    maxImageBytes?: number;
+    maxPromptChars?: number;
+  };
   /**
    * @deprecated One-time migration input for legacy recipes. Runtime channel
    * desired state is Chronicle-backed and changed with channel_open/close.
@@ -589,11 +610,46 @@ export interface RecipeWorkspaceMount {
 }
 
 export interface RecipeModules {
+  /** Durable resident-commissioned one-shot and recurring wakes. OPT-IN. */
+  scheduledWake?: boolean | {
+    maxPending?: number;
+    maxHorizonDays?: number;
+  };
+  /** macOS Seatbelt-confined command access to explicit project roots. */
+  projectShell?: {
+    roots: Array<{ name: string; path: string; description?: string; exclude?: string[] }>;
+    /** Additional runtime/resource trees that commands may read and execute, but not modify. */
+    readOnlyPaths?: string[];
+    timeoutMs?: number;
+    /** Permit an individual project-shell call to use timeout_mode="none". */
+    allowNoTimeout?: boolean;
+    maxOutputChars?: number;
+  };
+  /**
+   * Small public-web fetcher. OPT-IN. Accepts HTTPS GETs only, rejects
+   * local/private hosts, and caps both transfer and returned text. Optional
+   * downloads may target only named project-shell roots.
+   */
+  webFetch?: boolean | {
+    timeoutMs?: number;
+    maxResponseBytes?: number;
+    maxOutputChars?: number;
+    maxRedirects?: number;
+    maxDownloadBytes?: number;
+    downloadRoots?: string[];
+  };
   /**
    * Subagent forking (spawn/fork parallel agents). OPT-IN — defaults to off
    * and is not part of the standard recipe.
    */
-  subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
+  subagents?: boolean | {
+    /** Model used when a spawn/fork call omits its model field. */
+    defaultModel?: string;
+    /** Hard allowlist exposed in the tool schema and enforced at launch. */
+    allowedModels?: string[];
+    /** Per-inference output ceiling used when a call omits maxTokens. */
+    defaultMaxTokens?: number;
+  };
   /**
    * Lesson library (persistent knowledge store + lesson tools). OPT-IN —
    * defaults to off and is not part of the standard recipe.
@@ -1406,6 +1462,21 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.toolWrapperProseGuard must be a boolean, got ${JSON.stringify(agent.toolWrapperProseGuard)}.`);
   }
 
+  if (
+    agent.proseDelivery !== undefined &&
+    agent.proseDelivery !== 'live' &&
+    agent.proseDelivery !== 'terminal'
+  ) {
+    throw new Error(`Recipe agent.proseDelivery must be 'live' or 'terminal', got ${JSON.stringify(agent.proseDelivery)}.`);
+  }
+
+  if (agent.speakingRoom !== undefined) {
+    const room = agent.speakingRoom as { initialChannel?: unknown } | null;
+    if (!room || typeof room !== 'object' || typeof room.initialChannel !== 'string' || !room.initialChannel.trim()) {
+      throw new Error('Recipe agent.speakingRoom must be { initialChannel: "<channel id>" }.');
+    }
+  }
+
   if (agent.timezone !== undefined) {
     if (typeof agent.timezone !== 'string' || !agent.timezone.trim()) {
       throw new Error('Recipe agent.timezone must be a non-empty IANA time zone string.');
@@ -1920,6 +1991,31 @@ export function validateRecipe(raw: unknown): Recipe {
           throw new Error(`mcpServers.${id}.${field} must be an array of non-empty strings`);
         }
       }
+      if (server.allowHostCommands !== undefined && typeof server.allowHostCommands !== 'boolean') {
+        throw new Error(`mcpServers.${id}.allowHostCommands must be a boolean`);
+      }
+      if (server.hostImageTriage !== undefined) {
+        if (!server.hostImageTriage || typeof server.hostImageTriage !== 'object' || Array.isArray(server.hostImageTriage)) {
+          throw new Error(`mcpServers.${id}.hostImageTriage must be an object`);
+        }
+        const triage = server.hostImageTriage as Record<string, unknown>;
+        if (typeof triage.model !== 'string' || !triage.model.trim()) {
+          throw new Error(`mcpServers.${id}.hostImageTriage.model must be a non-empty string`);
+        }
+        const boundedIntegers: Array<[string, number, number]> = [
+          ['maxTokens', 1, 16_384],
+          ['maxImageBytes', 1, 10 * 1024 * 1024],
+          ['maxPromptChars', 1, 100_000],
+        ];
+        for (const [field, min, max] of boundedIntegers) {
+          const value = triage[field];
+          if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < min || (value as number) > max)) {
+            throw new Error(
+              `mcpServers.${id}.hostImageTriage.${field} must be an integer between ${min} and ${max}`,
+            );
+          }
+        }
+      }
       if (server.credentialFiles !== undefined) {
         if (!Array.isArray(server.credentialFiles)) {
           throw new Error(`mcpServers.${id}.credentialFiles must be an array`);
@@ -1982,6 +2078,147 @@ export function validateRecipe(raw: unknown): Recipe {
   // Validate workspace mounts if present
   if (obj.modules && typeof obj.modules === 'object') {
     const mods = obj.modules as Record<string, unknown>;
+    let projectShellRootNames: Set<string> | null = null;
+    if (mods.scheduledWake !== undefined && typeof mods.scheduledWake !== 'boolean') {
+      if (!mods.scheduledWake || typeof mods.scheduledWake !== 'object' || Array.isArray(mods.scheduledWake)) {
+        throw new Error('modules.scheduledWake must be a boolean or object.');
+      }
+      const sw = mods.scheduledWake as Record<string, unknown>;
+      for (const key of ['maxPending', 'maxHorizonDays']) {
+        if (sw[key] !== undefined &&
+            (typeof sw[key] !== 'number' || !Number.isSafeInteger(sw[key]) || (sw[key] as number) < 1)) {
+          throw new Error(`modules.scheduledWake.${key} must be a positive safe integer.`);
+        }
+      }
+    }
+    if (mods.subagents !== undefined && typeof mods.subagents !== 'boolean') {
+      if (!mods.subagents || typeof mods.subagents !== 'object' || Array.isArray(mods.subagents)) {
+        throw new Error('modules.subagents must be a boolean or object.');
+      }
+      const subagents = mods.subagents as Record<string, unknown>;
+      if (subagents.defaultModel !== undefined &&
+          (typeof subagents.defaultModel !== 'string' || !subagents.defaultModel.trim())) {
+        throw new Error('modules.subagents.defaultModel must be a non-empty string.');
+      }
+      if (subagents.defaultMaxTokens !== undefined &&
+          (typeof subagents.defaultMaxTokens !== 'number' ||
+            !Number.isSafeInteger(subagents.defaultMaxTokens) ||
+            (subagents.defaultMaxTokens as number) < 1)) {
+        throw new Error('modules.subagents.defaultMaxTokens must be a positive safe integer.');
+      }
+      if (subagents.allowedModels !== undefined) {
+        if (!Array.isArray(subagents.allowedModels) || subagents.allowedModels.length === 0 ||
+            !subagents.allowedModels.every((candidate) =>
+              typeof candidate === 'string' && candidate.trim().length > 0)) {
+          throw new Error('modules.subagents.allowedModels must be a non-empty array of model names.');
+        }
+        const allowedModels = subagents.allowedModels as string[];
+        if (new Set(allowedModels).size !== allowedModels.length) {
+          throw new Error('modules.subagents.allowedModels must not contain duplicates.');
+        }
+        if (typeof subagents.defaultModel !== 'string') {
+          throw new Error('modules.subagents.allowedModels requires an explicit defaultModel.');
+        }
+        if (!allowedModels.includes(subagents.defaultModel)) {
+          throw new Error('modules.subagents.defaultModel must be included in allowedModels.');
+        }
+      }
+    }
+    if (mods.projectShell !== undefined) {
+      if (!mods.projectShell || typeof mods.projectShell !== 'object' || Array.isArray(mods.projectShell)) {
+        throw new Error('modules.projectShell must be an object.');
+      }
+      const shell = mods.projectShell as Record<string, unknown>;
+      if (!Array.isArray(shell.roots) || shell.roots.length === 0) {
+        throw new Error('modules.projectShell.roots must be a non-empty array.');
+      }
+      const names = new Set<string>();
+      for (const candidate of shell.roots) {
+        if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+          throw new Error('Each modules.projectShell.roots entry must be an object.');
+        }
+        const root = candidate as Record<string, unknown>;
+        if (typeof root.name !== 'string' || !/^[a-z0-9][a-z0-9_-]*$/i.test(root.name)) {
+          throw new Error('Each project-shell root name must use only letters, digits, _ or -.');
+        }
+        if (names.has(root.name)) throw new Error(`Duplicate project-shell root name: ${root.name}`);
+        names.add(root.name);
+        if (typeof root.path !== 'string' || !isAbsolute(root.path)) {
+          throw new Error(`Project-shell root ${root.name} must have an absolute path.`);
+        }
+        if (root.description !== undefined && typeof root.description !== 'string') {
+          throw new Error(`Project-shell root ${root.name} description must be a string.`);
+        }
+        if (root.exclude !== undefined) {
+          if (!Array.isArray(root.exclude)) {
+            throw new Error(`Project-shell root ${root.name} exclude must be an array.`);
+          }
+          for (const excludedPath of root.exclude) {
+            if (typeof excludedPath !== 'string' || !excludedPath || isAbsolute(excludedPath)) {
+              throw new Error(`Project-shell root ${root.name} exclusions must be non-empty relative paths.`);
+            }
+            const resolvedExclude = resolve(root.path, excludedPath);
+            const relativeExclude = relative(root.path, resolvedExclude);
+            if (!relativeExclude || relativeExclude.startsWith('..') || isAbsolute(relativeExclude)) {
+              throw new Error(`Project-shell root ${root.name} exclusion escapes its root: ${excludedPath}`);
+            }
+          }
+        }
+      }
+      projectShellRootNames = names;
+      if (shell.readOnlyPaths !== undefined) {
+        if (!Array.isArray(shell.readOnlyPaths)) {
+          throw new Error('modules.projectShell.readOnlyPaths must be an array.');
+        }
+        const readOnlyPaths = new Set<string>();
+        for (const path of shell.readOnlyPaths) {
+          if (typeof path !== 'string' || !isAbsolute(path)) {
+            throw new Error('modules.projectShell.readOnlyPaths entries must be absolute paths.');
+          }
+          if (readOnlyPaths.has(path)) {
+            throw new Error(`Duplicate modules.projectShell.readOnlyPaths entry: ${path}`);
+          }
+          readOnlyPaths.add(path);
+        }
+      }
+      for (const key of ['timeoutMs', 'maxOutputChars']) {
+        if (shell[key] !== undefined &&
+            (typeof shell[key] !== 'number' || !Number.isSafeInteger(shell[key]) || (shell[key] as number) < 1)) {
+          throw new Error(`modules.projectShell.${key} must be a positive safe integer.`);
+        }
+      }
+      if (shell.allowNoTimeout !== undefined && typeof shell.allowNoTimeout !== 'boolean') {
+        throw new Error('modules.projectShell.allowNoTimeout must be a boolean.');
+      }
+    }
+    if (mods.webFetch !== undefined && typeof mods.webFetch !== 'boolean') {
+      if (!mods.webFetch || typeof mods.webFetch !== 'object' || Array.isArray(mods.webFetch)) {
+        throw new Error('modules.webFetch must be a boolean or object.');
+      }
+      const wf = mods.webFetch as Record<string, unknown>;
+      for (const key of ['timeoutMs', 'maxResponseBytes', 'maxOutputChars', 'maxRedirects', 'maxDownloadBytes']) {
+        if (wf[key] !== undefined &&
+            (typeof wf[key] !== 'number' || !Number.isInteger(wf[key]) || (wf[key] as number) < 1)) {
+          throw new Error(`modules.webFetch.${key} must be a positive integer.`);
+        }
+      }
+      if (wf.downloadRoots !== undefined) {
+        if (!Array.isArray(wf.downloadRoots) || wf.downloadRoots.length === 0) {
+          throw new Error('modules.webFetch.downloadRoots must be a non-empty array of project-shell root names.');
+        }
+        if (!projectShellRootNames) {
+          throw new Error('modules.webFetch.downloadRoots requires modules.projectShell.');
+        }
+        const seenDownloadRoots = new Set<string>();
+        for (const name of wf.downloadRoots) {
+          if (typeof name !== 'string' || !projectShellRootNames.has(name)) {
+            throw new Error(`Unknown project-shell download root: ${String(name)}`);
+          }
+          if (seenDownloadRoots.has(name)) throw new Error(`Duplicate web-fetch download root: ${name}`);
+          seenDownloadRoots.add(name);
+        }
+      }
+    }
     if (mods.workspace && typeof mods.workspace === 'object') {
       const ws = mods.workspace as Record<string, unknown>;
       if (!Array.isArray(ws.mounts) || ws.mounts.length === 0) {

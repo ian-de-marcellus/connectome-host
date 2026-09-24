@@ -1182,6 +1182,10 @@ export async function runTui(app: AppContext): Promise<void> {
       // Truncate task to 60 chars
       const task = sa.task.length > 60 ? sa.task.slice(0, 57) + '...' : sa.task;
       lines.push({ text: `  ${detail}task: ${task}`, color: detailColor });
+      if (sa.model) {
+        const budget = sa.maxTokens ? `  max output/round: ${sa.maxTokens.toLocaleString('en-US')}` : '';
+        lines.push({ text: `  ${detail}model: ${sa.model}${budget}`, color: detailColor });
+      }
       if (sa.statusMessage) {
         lines.push({ text: `  ${detail}tool: ${sa.statusMessage} (${sa.toolCallsCount} calls)`, color: detailColor });
       }

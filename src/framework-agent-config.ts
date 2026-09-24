@@ -12,6 +12,8 @@ export type FrameworkAgentConfig = AgentConfig & {
   refusalHandling?: Recipe['agent']['refusalHandling'];
   sameRoundThinkTextPolicy?: 'public' | 'private';
   retirement?: FrameworkRetirementConfig;
+  proseDelivery?: 'live' | 'terminal';
+  speakingRoom?: { initialChannel: string };
 };
 
 /**
@@ -218,6 +220,7 @@ export function buildFrameworkAgentConfig(
     ...(recipe.agent.thinking && { thinking: recipe.agent.thinking }),
     ...(recipe.agent.refusalHandling && { refusalHandling: recipe.agent.refusalHandling }),
     ...(retirement && { retirement }),
+    ...(recipe.agent.speakingRoom && { speakingRoom: recipe.agent.speakingRoom }),
     ...(recipe.agent.sameRoundThinkTextPolicy !== undefined
       ? { sameRoundThinkTextPolicy: recipe.agent.sameRoundThinkTextPolicy }
       : {}),
@@ -226,6 +229,9 @@ export function buildFrameworkAgentConfig(
       : {}),
     ...(recipe.agent.toolWrapperProseGuard !== undefined
       ? { toolWrapperProseGuard: recipe.agent.toolWrapperProseGuard }
+      : {}),
+    ...(recipe.agent.proseDelivery !== undefined
+      ? { proseDelivery: recipe.agent.proseDelivery }
       : {}),
   };
 }

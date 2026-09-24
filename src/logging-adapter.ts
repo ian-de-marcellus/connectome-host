@@ -28,6 +28,7 @@ import type {
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
 import { summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
+import { loadModelContextSubstitutionsFromEnv } from './model-context-substitutions.js';
 
 /** Live read of the current reasoning setting. The host wires this to
  *  `SettingsModule.getReasoning()` so toggles via the `agent_settings` tool's
@@ -79,6 +80,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  the differentiator). Costs disk, not memory (the raw request is already
    *  captured per-call for the summary); pair with llm-calls rotation. */
   private readonly fullPayloads: boolean = envFlag(process.env.LLM_CALLS_FULL_PAYLOADS);
+  private readonly modelContextSubstitutions = loadModelContextSubstitutionsFromEnv();
+
 
   constructor(
     config: ConstructorParameters<typeof AnthropicAdapter>[0],
@@ -268,7 +271,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const t0 = Date.now();
-    const effective = this.withOAuthIdentity(this.withReasoning(request));
+    const contextual = this.modelContextSubstitutions?.apply(request, 'complete').request ?? request;
+    const effective = this.withOAuthIdentity(this.withReasoning(contextual));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
     try {
@@ -305,7 +309,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const t0 = Date.now();
-    const effective = this.withOAuthIdentity(this.withReasoning(request));
+    const contextual = this.modelContextSubstitutions?.apply(request, 'stream').request ?? request;
+    const effective = this.withOAuthIdentity(this.withReasoning(contextual));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
     try {

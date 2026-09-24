@@ -43,6 +43,8 @@ export interface SubagentModuleConfig {
   currentDepth?: number;
   /** Default model for subagents */
   defaultModel?: string;
+  /** Models subagents may explicitly select. Omit to allow any model. */
+  allowedModels?: string[];
   /** Default max tokens per subagent inference */
   defaultMaxTokens?: number;
   /** Which parent agent this module serves (for fork context access) */
@@ -62,6 +64,10 @@ export interface SubagentResult {
   findings: string[];
   issues: string[];
   toolCallsCount: number;
+  /** Effective model used for every inference in this subagent run. */
+  model: string;
+  /** Maximum output tokens permitted per inference in this subagent run. */
+  maxTokens: number;
 }
 
 interface SpawnInput {
@@ -146,6 +152,10 @@ interface PersistedSubagent {
   findingsCount: number;
   statusMessage?: string;
   parent?: string;
+  /** Optional for backward compatibility with pre-policy persisted records. */
+  model?: string;
+  /** Optional for backward compatibility with pre-policy persisted records. */
+  maxTokens?: number;
 }
 
 /** Observable state of an active subagent, for TUI display. See
@@ -163,6 +173,10 @@ export interface ActiveSubagent {
   statusMessage?: string;
   toolCallsCount: number;
   findingsCount: number;
+  /** Effective model, absent only on records restored from an older host. */
+  model?: string;
+  /** Per-inference output ceiling, absent only on older restored records. */
+  maxTokens?: number;
 }
 
 /** Live state captured for peek observability. */
@@ -215,6 +229,8 @@ export interface SubagentPeekSnapshot {
   currentStream: string;
   pendingToolCalls: Array<{ name: string; input?: unknown }>;
   toolCallsCount: number;
+  model?: string;
+  maxTokens?: number;
   /** True if the subagent appears stalled: running status, no active stream, elapsed > threshold. */
   isZombie: boolean;
 }
@@ -385,6 +401,8 @@ export function materialiseStructuralFork(
 export class SubagentModule implements Module {
   readonly name = 'subagent';
 
+  private static readonly FALLBACK_MODEL = 'claude-haiku-4-5-20251001';
+
   private ctx: ModuleContext | null = null;
   private config: SubagentModuleConfig;
   private framework: AgentFramework | null = null;
@@ -398,6 +416,9 @@ export class SubagentModule implements Module {
   private effectiveConcurrent: number;       // Current effective limit (may be reduced)
   private activeConcurrent = 0;
   private waitQueue: Array<() => void> = [];
+  /** Slot owners force-released by the zombie reaper. Their eventual finally
+   *  blocks must not decrement a slot now owned by a queued successor. */
+  private forceReleasedSlotOwners = new Set<string>();
   private consecutiveSuccesses = 0;
   private lastRateLimitAt = 0;
   private rateLimitCooldownMs = 30_000;      // Delay after rate limit before releasing next slot
@@ -446,6 +467,25 @@ export class SubagentModule implements Module {
   private agentDepths = new Map<string, number>();  // framework agent name → fork depth
 
   constructor(config: SubagentModuleConfig = {}) {
+    if (config.allowedModels) {
+      if (config.allowedModels.length === 0) {
+        throw new Error('Subagent allowedModels must not be empty.');
+      }
+      const unique = new Set(config.allowedModels);
+      if (unique.size !== config.allowedModels.length || config.allowedModels.some((model) => !model.trim())) {
+        throw new Error('Subagent allowedModels must contain unique, non-empty model names.');
+      }
+      const effectiveDefault = config.defaultModel ?? SubagentModule.FALLBACK_MODEL;
+      if (!unique.has(effectiveDefault)) {
+        throw new Error(
+          `Subagent default model '${effectiveDefault}' is not in allowedModels: ${config.allowedModels.join(', ')}`,
+        );
+      }
+    }
+    if (config.defaultMaxTokens !== undefined &&
+        (!Number.isSafeInteger(config.defaultMaxTokens) || config.defaultMaxTokens < 1)) {
+      throw new Error('Subagent defaultMaxTokens must be a positive safe integer.');
+    }
     this.config = config;
     this.maxDepth = config.maxDepth ?? 3;
     this.currentDepth = config.currentDepth ?? 0;
@@ -454,6 +494,67 @@ export class SubagentModule implements Module {
     this.maxPromptTokens = config.maxPromptTokens ?? 190_000;
     this.maxExecutionMs = config.maxExecutionMs ?? 600_000;
     this.maxRetries = config.maxRetries ?? 2;
+  }
+
+  private getDefaultModel(): string {
+    return this.config.defaultModel ?? SubagentModule.FALLBACK_MODEL;
+  }
+
+  private resolveModel(requested?: string): string {
+    if (requested !== undefined && (typeof requested !== 'string' || !requested.trim())) {
+      throw new Error('Subagent model must be a non-empty string.');
+    }
+    const model = requested ?? this.getDefaultModel();
+    if (this.config.allowedModels && !this.config.allowedModels.includes(model)) {
+      throw new Error(
+        `Subagent model '${model}' is not allowed. Choose one of: ${this.config.allowedModels.join(', ')}. ` +
+        `The default is ${this.getDefaultModel()}.`,
+      );
+    }
+    return model;
+  }
+
+  private describeModel(model: string): string {
+    const friendly = /haiku-4-5/i.test(model) ? 'Haiku 4.5 · lower usage; routine work'
+      : /sonnet-5/i.test(model) ? 'Sonnet 5 · balanced; general work'
+      : /opus-5/i.test(model) ? 'Opus 5 · highest usage; difficult work'
+      : model;
+    return friendly === model ? model : `${friendly} (${model})`;
+  }
+
+  private getModelInputSchema(): { type: string; description: string; enum?: string[] } {
+    const defaultModel = this.getDefaultModel();
+    const allowed = this.config.allowedModels;
+    const choices = allowed?.map((model) => this.describeModel(model)).join('; ');
+    return {
+      type: 'string',
+      ...(allowed ? { enum: [...allowed] } : {}),
+      description: allowed
+        ? `Model for this subagent. Available: ${choices}. Omit to use the default: ${this.describeModel(defaultModel)}.`
+        : `Model override. Omit to use the default: ${this.describeModel(defaultModel)}.`,
+    };
+  }
+
+  private launchReceipt(
+    name: string,
+    type: 'spawn' | 'fork',
+    model: string,
+    maxTokens: number,
+    queuedPosition?: number,
+  ): string {
+    const context = type === 'spawn'
+      ? 'Fresh context.'
+      : 'Inherited parent context; input usage may be substantially higher than a fresh spawn.';
+    const verb = type === 'spawn' ? 'spawned' : 'forked';
+    const admission = queuedPosition === undefined
+      ? 'Running in background.'
+      : `Accepted and queued at position ${queuedPosition}; it will start automatically when a slot frees. ` +
+        'Queue waiting has no admission timeout.';
+    const opening = queuedPosition === undefined
+      ? `Subagent '${name}' ${verb}.`
+      : `Subagent '${name}' ${type} request accepted.`;
+    return `${opening} Model: ${this.describeModel(model)}. ` +
+      `Max output: ${maxTokens.toLocaleString('en-US')} tokens per inference. ${context} ${admission}`;
   }
 
   /** Set the framework reference. Must be called after framework creation. */
@@ -635,6 +736,8 @@ export class SubagentModule implements Module {
         findingsCount: sa.findingsCount,
         statusMessage: sa.statusMessage,
         parent: this.parentMap.get(sa.name),
+        model: sa.model,
+        maxTokens: sa.maxTokens,
       };
     }
     this.ctx.setState({ agents });
@@ -671,6 +774,8 @@ export class SubagentModule implements Module {
         toolCallsCount: pa.toolCallsCount,
         findingsCount: pa.findingsCount,
         statusMessage: pa.status === 'running' ? 'interrupted (branch/session switch)' : pa.statusMessage,
+        model: pa.model,
+        maxTokens: pa.maxTokens,
       };
       this.activeSubagents.set(key, sa);
       if (pa.parent) {
@@ -680,25 +785,29 @@ export class SubagentModule implements Module {
   }
 
   getTools(): ToolDefinition[] {
+    const modelInputSchema = this.getModelInputSchema();
+    const maxTokensDescription = this.config.defaultMaxTokens !== undefined
+      ? `Max output tokens per inference. Omit to use the configured default of ${this.config.defaultMaxTokens.toLocaleString('en-US')}. This is a per-round ceiling, not a total task budget.`
+      : 'Max output tokens per inference. Omit to inherit the parent agent\'s maxTokens. This is a per-round ceiling, not a total task budget.';
     return [
       {
         name: 'spawn',
-        description: 'Spawn a fresh subagent with a system prompt and task. Async by default — returns immediately and delivers results as a message. Pass sync:true to block until completion.',
+        description: 'Spawn a fresh subagent with a system prompt and task. This starts with fresh context and is generally the lower-usage choice. Async by default — returns immediately and delivers results as a message. If every concurrency slot is busy, an accepted task waits until a slot frees instead of timing out in the queue; the receipt reports its queue position. Pass sync:true to block until completion.',
         inputSchema: {
           type: 'object',
           properties: {
             name: { type: 'string', description: 'Short name for the subagent' },
             systemPrompt: { type: 'string', description: 'System prompt for the subagent' },
             task: { type: 'string', description: 'The task for the subagent to perform' },
-            model: { type: 'string', description: 'Model override (optional)' },
-            maxTokens: { type: 'number', description: 'Max output tokens per inference (optional). Defaults to the recipe-level subagent default, else the parent agent\'s maxTokens.' },
+            model: modelInputSchema,
+            maxTokens: { type: 'number', description: maxTokensDescription },
             tools: {
               type: 'array',
               items: { type: 'string' },
               description: 'Tool names the subagent can use (default: all). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds, beginning only after a concurrency slot is acquired. Sync tasks have a 600s default execution deadline; an explicit value also sets their auto-detach time. Async tasks have no default timeout — only set this if you need a hard execution deadline.' },
           },
           required: ['name', 'systemPrompt', 'task'],
         },
@@ -709,17 +818,19 @@ export class SubagentModule implements Module {
           "Fork the current conversation into two parallel streams that share all memory of what you've done so far. " +
           "Both streams are continuations of the same self — one carries on with the broader agenda, the other focuses " +
           "exclusively on a new intention (the `task`). The tool_result you receive identifies which stream you are. " +
-          "Async by default; pass sync:true to block until completion.",
+          "A fork inherits the parent's compiled context and can therefore use substantially more input than a fresh spawn. " +
+          "Async by default. If every concurrency slot is busy, an accepted task waits until a slot frees instead of " +
+          "timing out in the queue; the receipt reports its queue position. Pass sync:true to block until completion.",
         inputSchema: {
           type: 'object',
           properties: {
             name: { type: 'string', description: 'Short name for the forked stream' },
             task: { type: 'string', description: 'The intention this fork stream should pursue' },
             systemPrompt: { type: 'string', description: 'Override system prompt (optional, defaults to parent)' },
-            model: { type: 'string', description: 'Model override (optional)' },
-            maxTokens: { type: 'number', description: 'Max output tokens per inference (optional). Defaults to the recipe-level subagent default, else the parent agent\'s maxTokens.' },
+            model: modelInputSchema,
+            maxTokens: { type: 'number', description: maxTokensDescription },
             sync: { type: 'boolean', description: 'If true, block until fork completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds, beginning only after a concurrency slot is acquired. Sync tasks have a 600s default execution deadline; an explicit value also sets their auto-detach time. Async tasks have no default timeout — only set this if you need a hard execution deadline.' },
           },
           required: ['name', 'task'],
         },
@@ -829,7 +940,10 @@ export class SubagentModule implements Module {
       const parent = this.parentMap.get(sa.name) ?? 'agent';
       const parentShort = parent.replace(/^(spawn|fork)-/, '').replace(/-d\d+-\d+$/, '').replace(/-retry\d+$/, '');
       const task = sa.task.length > 50 ? sa.task.slice(0, 47) + '...' : sa.task;
-      lines.push(`  ${sa.name} [${sa.type}] ${sa.status} ${elapsed}s ${sa.toolCallsCount}calls parent:${parentShort} "${task}"`);
+      const launch = sa.model
+        ? ` model:${sa.model}${sa.maxTokens ? ` max:${sa.maxTokens}` : ''}`
+        : '';
+      lines.push(`  ${sa.name} [${sa.type}] ${sa.status} ${elapsed}s ${sa.toolCallsCount}calls${launch} parent:${parentShort} "${task}"`);
     }
 
     // Also show async handles still running, but only those owned by the
@@ -858,9 +972,13 @@ export class SubagentModule implements Module {
 
   /**
    * Acquire a concurrency slot. Returns how long the caller waited (0 = immediate).
-   * Throws if the slot is not acquired within `slotTimeoutMs`.
+   *
+   * Once accepted, queued work waits until a slot is available. Queueing is an
+   * admission state, not execution, so it must not silently consume or invent
+   * a task deadline. The optional callback runs synchronously when the caller
+   * joins the queue, allowing async tool receipts to report an exact position.
    */
-  private async acquireSlot(slotTimeoutMs = 120_000): Promise<{ waitedMs: number }> {
+  private async acquireSlot(onQueued?: (position: number) => void): Promise<{ waitedMs: number }> {
     if (this.activeConcurrent < this.effectiveConcurrent) {
       this.activeConcurrent++;
       return { waitedMs: 0 };
@@ -874,71 +992,14 @@ export class SubagentModule implements Module {
     }
 
     const startWait = Date.now();
-    return new Promise<{ waitedMs: number }>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        // Remove ourselves from the wait queue
-        const idx = this.waitQueue.indexOf(onSlot);
-        if (idx >= 0) this.waitQueue.splice(idx, 1);
-
-        // Last-chance zombie reclamation before failing
-        const reclaimed = this.reclaimZombieSlots();
-        if (reclaimed > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-          this.activeConcurrent++;
-          resolve({ waitedMs: Date.now() - startWait });
-          return;
-        }
-
-        // Surface which subagents currently hold the slots, with silence
-        // and total runtime. Without this the caller only sees "5/5 in
-        // use" and has no signal for which to cancel. In production this
-        // lack of detail meant the parent agent couldn't self-rescue —
-        // it had to wait days for the demand-driven reaper to fire on
-        // its own.
-        const holders = this.describeSlotHolders();
-        const holderLines = holders.length > 0
-          ? `\nSlots held by:\n${holders.map(h => `  - ${h}`).join('\n')}`
-          : '';
-
-        reject(new Error(
-          `Timed out waiting for a concurrency slot after ${slotTimeoutMs}ms ` +
-          `(${this.activeConcurrent}/${this.effectiveConcurrent} slots in use, ` +
-          `${this.waitQueue.length} still queued). ` +
-          `Limit parallel forks/spawns to ${this.effectiveConcurrent}.` +
-          holderLines
-        ));
-      }, slotTimeoutMs);
-
+    return new Promise<{ waitedMs: number }>((resolve) => {
       const onSlot = () => {
-        clearTimeout(timer);
         resolve({ waitedMs: Date.now() - startWait });
       };
 
       this.waitQueue.push(onSlot);
+      onQueued?.(this.waitQueue.length);
     });
-  }
-
-  /**
-   * Summarize subagents currently holding concurrency slots. Used to enrich
-   * the slot-acquisition timeout error so the calling agent can decide
-   * which stale forks to cancel rather than helplessly waiting on the
-   * demand-driven reaper.
-   */
-  private describeSlotHolders(): string[] {
-    const lines: string[] = [];
-    const now = Date.now();
-    for (const sa of this.activeSubagents.values()) {
-      if (sa.status !== 'running') continue;
-      const silentS = Math.floor((now - sa.lastActivityAt) / 1000);
-      const runtimeS = Math.floor((now - sa.startedAt) / 1000);
-      const live = this.liveSubagents.get(sa.name);
-      const streamState = live?.currentStream ? 'streaming' :
-        live?.pendingToolCalls?.length ? `awaiting ${live.pendingToolCalls.length} tool(s)` :
-        'idle';
-      lines.push(
-        `${sa.name} [${sa.type}] runtime=${runtimeS}s silent=${silentS}s ${streamState}`
-      );
-    }
-    return lines;
   }
 
   /**
@@ -1015,24 +1076,36 @@ export class SubagentModule implements Module {
         entry.completedAt = Date.now();
         entry.statusMessage = 'zombie — slot reclaimed';
 
-        // Release the slot (the finally block in runSpawn/runFork will also
-        // call releaseSlot, but that's safe — activeConcurrent just goes to
-        // max(0, activeConcurrent-1) effectively)
+        // Release the slot immediately, but remember its former owner. The
+        // cancelled run's eventual finally block must not decrement a slot
+        // that may already have been handed to a queued successor.
+        this.forceReleasedSlotOwners.add(displayName);
         this.activeConcurrent = Math.max(0, this.activeConcurrent - 1);
         reclaimed++;
       }
     }
 
+    if (reclaimed > 0) this.drainWaitQueue();
     return reclaimed;
   }
 
-  private releaseSlot(): void {
-    if (this.activeConcurrent <= 0) return; // Guard against double-release (e.g., zombie reclamation + finally)
-    this.activeConcurrent--;
-    if (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
+  private drainWaitQueue(): void {
+    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
       this.activeConcurrent++;
       this.waitQueue.shift()!();
     }
+  }
+
+  private releaseSlot(ownerName: string): void {
+    // Zombie reclamation already released this owner's permit and may have
+    // reassigned it. Consuming the marker avoids a double-decrement.
+    if (this.forceReleasedSlotOwners.delete(ownerName)) {
+      this.drainWaitQueue();
+      return;
+    }
+    if (this.activeConcurrent <= 0) return;
+    this.activeConcurrent--;
+    this.drainWaitQueue();
   }
 
   /** Format a concurrency notice for tool results (empty string if no wait). */
@@ -1099,10 +1172,7 @@ export class SubagentModule implements Module {
       this.effectiveConcurrent = this.configuredMaxConcurrent;
     }
     // If we were throttled below the new ceiling, let waiters through
-    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
-    }
+    this.drainWaitQueue();
   }
 
   /** Get current concurrency status for observability. */
@@ -1361,6 +1431,8 @@ export class SubagentModule implements Module {
       currentStream: live.currentStream,
       pendingToolCalls: live.pendingToolCalls,
       toolCallsCount: entry?.toolCallsCount ?? 0,
+      model: entry?.model,
+      maxTokens: entry?.maxTokens,
       isZombie,
     };
   }
@@ -1389,7 +1461,12 @@ export class SubagentModule implements Module {
   }
 
   private resolveMaxTokens(callMaxTokens: number | undefined, parentAgentName?: string): number {
-    if (callMaxTokens !== undefined) return callMaxTokens;
+    if (callMaxTokens !== undefined) {
+      if (!Number.isSafeInteger(callMaxTokens) || callMaxTokens < 1) {
+        throw new Error('Subagent maxTokens must be a positive safe integer.');
+      }
+      return callMaxTokens;
+    }
     if (this.config.defaultMaxTokens !== undefined) return this.config.defaultMaxTokens;
     const parentName = parentAgentName ?? this.config.parentAgentName;
     if (parentName) {
@@ -1443,6 +1520,20 @@ export class SubagentModule implements Module {
   // =========================================================================
 
   private async handleSpawn(input: SpawnInput, callerAgentName?: string): Promise<ToolResult> {
+    let effectiveInput: SpawnInput;
+    try {
+      effectiveInput = {
+        ...input,
+        model: this.resolveModel(input.model),
+        maxTokens: this.resolveMaxTokens(input.maxTokens, callerAgentName),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        isError: true,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
     const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
     if (callerDepth >= this.maxDepth) {
       return {
@@ -1454,11 +1545,12 @@ export class SubagentModule implements Module {
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    // Sync mode: block until completion, but detachable mid-flight. The
+    // default 600s value is an execution deadline; only a caller-supplied
+    // timeout also arms runDetachable's background transition.
     if (input.sync) {
       const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runSpawn(input, callerAgentName, callerDepth, timeoutMs);
+      const promise = this.runSpawn(effectiveInput, callerAgentName, callerDepth, timeoutMs);
       const result = await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs);
       return result;
     }
@@ -1466,17 +1558,47 @@ export class SubagentModule implements Module {
     // Async mode (default): fire-and-forget, deliver result as message.
     // No default timeout — async agents run until they finish unless
     // the caller explicitly sets timeoutMs.
-    const promise = this.runSpawn(input, callerAgentName, callerDepth, input.timeoutMs);
+    let queuedPosition: number | undefined;
+    const promise = this.runSpawn(
+      effectiveInput,
+      callerAgentName,
+      callerDepth,
+      input.timeoutMs,
+      (position) => { queuedPosition = position; },
+    );
     this.asyncHandles.set(input.name, { name: input.name, type: 'spawn', promise, parentAgentName });
 
     promise
       .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
       .catch(err => this.deliverAsyncError(input.name, err, parentAgentName));
 
-    return { success: true, data: `Subagent '${input.name}' spawned. Running in background.` };
+    return {
+      success: true,
+      data: this.launchReceipt(
+        input.name,
+        'spawn',
+        effectiveInput.model!,
+        effectiveInput.maxTokens!,
+        queuedPosition,
+      ),
+    };
   }
 
   private async handleFork(input: ForkInput, callerAgentName?: string, callToolUseId?: string): Promise<ToolResult> {
+    let effectiveInput: ForkInput;
+    try {
+      effectiveInput = {
+        ...input,
+        model: this.resolveModel(input.model),
+        maxTokens: this.resolveMaxTokens(input.maxTokens, callerAgentName),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        isError: true,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
     const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
     if (callerDepth >= this.maxDepth) {
       return {
@@ -1488,11 +1610,12 @@ export class SubagentModule implements Module {
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    // Sync mode: block until completion, but detachable mid-flight. The
+    // default 600s value is an execution deadline; only a caller-supplied
+    // timeout also arms runDetachable's background transition.
     if (input.sync) {
       const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runFork(input, callerAgentName, callerDepth, timeoutMs, callToolUseId);
+      const promise = this.runFork(effectiveInput, callerAgentName, callerDepth, timeoutMs, callToolUseId);
       const result = await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs);
       return result;
     }
@@ -1500,14 +1623,31 @@ export class SubagentModule implements Module {
     // Async mode (default): fire-and-forget, deliver result as message.
     // No default timeout — async agents run until they finish unless
     // the caller explicitly sets timeoutMs.
-    const promise = this.runFork(input, callerAgentName, callerDepth, input.timeoutMs, callToolUseId);
+    let queuedPosition: number | undefined;
+    const promise = this.runFork(
+      effectiveInput,
+      callerAgentName,
+      callerDepth,
+      input.timeoutMs,
+      callToolUseId,
+      (position) => { queuedPosition = position; },
+    );
     this.asyncHandles.set(input.name, { name: input.name, type: 'fork', promise, parentAgentName });
 
     promise
       .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
       .catch(err => this.deliverAsyncError(input.name, err, parentAgentName));
 
-    return { success: true, data: `Subagent '${input.name}' forked. Running in background.` };
+    return {
+      success: true,
+      data: this.launchReceipt(
+        input.name,
+        'fork',
+        effectiveInput.model!,
+        effectiveInput.maxTokens!,
+        queuedPosition,
+      ),
+    };
   }
 
   private deliverAsyncResult(name: string, result: SubagentResult, parentAgentName: string): void {
@@ -1516,7 +1656,8 @@ export class SubagentModule implements Module {
 
     this.ctx.addMessage('user', [{
       type: 'text',
-      text: `[Subagent '${name}' returned]\n\n${result.summary}`,
+      text: `[Subagent '${name}' returned · ${this.describeModel(result.model)} · ` +
+        `max ${result.maxTokens.toLocaleString('en-US')} output tokens per inference]\n\n${result.summary}`,
     }]);
     this.ctx.pushEvent({
       type: 'inference-request',
@@ -1688,15 +1829,23 @@ export class SubagentModule implements Module {
   // Subagent Execution
   // =========================================================================
 
-  private async runSpawn(input: SpawnInput, _callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot();
+  private async runSpawn(
+    input: SpawnInput,
+    _callerAgentName?: string,
+    callerDepth = 0,
+    executionTimeoutMs?: number,
+    onQueued?: (position: number) => void,
+  ): Promise<SubagentResult> {
+    const model = this.resolveModel(input.model);
+    const maxTokens = this.resolveMaxTokens(input.maxTokens, _callerAgentName);
+    const { waitedMs } = await this.acquireSlot(onQueued);
     const childDepth = callerDepth + 1;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
       name: input.name, type: 'spawn', task: input.task,
       status: 'running', startedAt: now, lastActivityAt: now,
-      toolCallsCount: 0, findingsCount: 0,
+      toolCallsCount: 0, findingsCount: 0, model, maxTokens,
     };
     const entryKey = `spawn-${input.name}`;
     this.activeSubagents.set(entryKey, entry);
@@ -1705,7 +1854,6 @@ export class SubagentModule implements Module {
 
     try {
       const framework = this.getFramework();
-      const model = input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001';
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -1714,7 +1862,7 @@ export class SubagentModule implements Module {
           name: agentName,
           model,
           systemPrompt: input.systemPrompt,
-          maxTokens: this.resolveMaxTokens(input.maxTokens, _callerAgentName),
+          maxTokens,
           ...(this.resolveProseRouting(_callerAgentName) !== undefined
             ? { proseRouting: this.resolveProseRouting(_callerAgentName) }
             : {}),
@@ -1781,7 +1929,7 @@ export class SubagentModule implements Module {
           const notice = this.concurrencyNotice(waitedMs);
           const finalSummary = notice + speech;
           this.emit(input.name, { type: 'done', summary: finalSummary, lastInputTokens: this.lastInputTokens.get(input.name) });
-          return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
+          return { summary: finalSummary, findings: [], issues: [], toolCallsCount, model, maxTokens };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
           this.cancellationHandles.delete(input.name);
@@ -1798,7 +1946,7 @@ export class SubagentModule implements Module {
             const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
             const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
             this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
-            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
+            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount, model, maxTokens };
           }
 
           if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
@@ -1824,19 +1972,28 @@ export class SubagentModule implements Module {
       throw lastError!;
     } finally {
       this.persistState();
-      this.releaseSlot();
+      this.releaseSlot(input.name);
     }
   }
 
-  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number, callToolUseId?: string): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot();
+  private async runFork(
+    input: ForkInput,
+    callerAgentName?: string,
+    callerDepth = 0,
+    executionTimeoutMs?: number,
+    callToolUseId?: string,
+    onQueued?: (position: number) => void,
+  ): Promise<SubagentResult> {
+    const model = this.resolveModel(input.model);
+    const maxTokens = this.resolveMaxTokens(input.maxTokens, callerAgentName);
+    const { waitedMs } = await this.acquireSlot(onQueued);
     const childDepth = callerDepth + 1;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
       name: input.name, type: 'fork', task: input.task,
       status: 'running', startedAt: now, lastActivityAt: now,
-      toolCallsCount: 0, findingsCount: 0,
+      toolCallsCount: 0, findingsCount: 0, model, maxTokens,
     };
     this.activeSubagents.set(input.name, entry);
     if (callerAgentName) this.parentMap.set(input.name, callerAgentName);
@@ -1854,7 +2011,6 @@ export class SubagentModule implements Module {
       const systemPrompt = input.systemPrompt
         ?? (parentAgent ? parentAgent.systemPrompt : 'You are a research assistant.');
 
-      const model = input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001';
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -1869,7 +2025,7 @@ export class SubagentModule implements Module {
           name: agentName,
           model,
           systemPrompt,
-          maxTokens: this.resolveMaxTokens(input.maxTokens, callerAgentName),
+          maxTokens,
           ...(this.resolveProseRouting(callerAgentName) !== undefined
             ? { proseRouting: this.resolveProseRouting(callerAgentName) }
             : {}),
@@ -1942,7 +2098,7 @@ export class SubagentModule implements Module {
                 type: 'tool_use',
                 id: fallbackForkId,
                 name: 'subagent--fork',
-                input: { name: input.name, task: input.task },
+                input: { name: input.name, task: input.task, model, maxTokens },
               }] as ContentBlock[]);
               contextManager.addMessage('user', [{
                 type: 'tool_result',
@@ -1995,7 +2151,7 @@ export class SubagentModule implements Module {
           const notice = this.concurrencyNotice(waitedMs);
           const finalSummary = notice + speech;
           this.emit(input.name, { type: 'done', summary: finalSummary, lastInputTokens: this.lastInputTokens.get(input.name) });
-          return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
+          return { summary: finalSummary, findings: [], issues: [], toolCallsCount, model, maxTokens };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
           this.cancellationHandles.delete(input.name);
@@ -2010,7 +2166,7 @@ export class SubagentModule implements Module {
             const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
             const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
             this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
-            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
+            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount, model, maxTokens };
           }
 
           if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
@@ -2036,7 +2192,7 @@ export class SubagentModule implements Module {
       throw lastError!;
     } finally {
       this.persistState();
-      this.releaseSlot();
+      this.releaseSlot(input.name);
     }
   }
 

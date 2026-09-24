@@ -2559,6 +2559,8 @@ export class WebUiModule implements Module {
             pendingToolCalls: Array<{ name: string; input?: unknown }>;
             elapsedMs: number;
             isZombie: boolean;
+            model?: string;
+            maxTokens?: number;
           }>>;
         }
       | undefined;
@@ -2596,6 +2598,8 @@ export class WebUiModule implements Module {
         pendingToolCalls: Array<{ name: string; input?: unknown }>;
         elapsedMs: number;
         isZombie: boolean;
+        model?: string;
+        maxTokens?: number;
       }>>;
     },
     scope: string,
@@ -2616,6 +2620,8 @@ export class WebUiModule implements Module {
       `msgs=${snap.messageCount}`,
       `elapsed=${Math.round(snap.elapsedMs / 1000)}s`,
     ];
+    if (snap.model) headerBits.push(`model=${snap.model}`);
+    if (snap.maxTokens) headerBits.push(`max-output/round=${snap.maxTokens}`);
     if (snap.isZombie) headerBits.push('zombie');
     this.send(client, {
       type: 'peek',

@@ -36,18 +36,21 @@ import { SettingsModule } from './modules/settings-module.js';
 import { AgentFramework, WorkspaceModule, resolveTimeZone, HistoryModule, type Module } from '@animalabs/agent-framework';
 import { resolve, join, basename } from 'node:path';
 import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
+import { ScheduledWakeModule } from './modules/scheduled-wake-module.js';
+import { ProjectShellModule } from './modules/project-shell-module.js';
 import { FleetModule, type FleetModuleConfig } from './modules/fleet-module.js';
 import { ActivityModule } from './modules/activity-module.js';
 import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
 import { WebUiModule } from './modules/web-ui-module.js';
+import { WebFetchModule } from './modules/web-fetch-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
@@ -218,6 +221,22 @@ export async function createFramework(
   // adapter can read its state for cross-cutting concerns like reasoning).
   const moduleInstances: Module[] = [new TuiModule(), new TimeModule(timeZone), settingsModule];
 
+  if (modules.scheduledWake) {
+    const scheduledWakeConfig = typeof modules.scheduledWake === 'object' ? modules.scheduledWake : {};
+    moduleInstances.push(new ScheduledWakeModule({ timeZone, ...scheduledWakeConfig }));
+  }
+
+  if (modules.projectShell) {
+    moduleInstances.push(new ProjectShellModule({
+      roots: modules.projectShell.roots.map((root) => ({ ...root, path: resolve(root.path) })),
+      scratchPath: resolve(storePath, 'project-shell'),
+      readOnlyPaths: modules.projectShell.readOnlyPaths?.map((path) => resolve(path)),
+      timeoutMs: modules.projectShell.timeoutMs,
+      allowNoTimeout: modules.projectShell.allowNoTimeout,
+      maxOutputChars: modules.projectShell.maxOutputChars,
+    }));
+  }
+
   // Subagents. OPT-IN — not part of the standard recipe; enable explicitly
   // via modules.subagents when an agent should fork parallel workers.
   let subagentModule: SubagentModule | null = null;
@@ -226,6 +245,7 @@ export async function createFramework(
     subagentModule = new SubagentModule({
       parentAgentName: agentName,
       defaultModel: subagentConfig.defaultModel || model,
+      allowedModels: subagentConfig.allowedModels,
       defaultMaxTokens: subagentConfig.defaultMaxTokens,
     });
     moduleInstances.push(subagentModule);
@@ -330,6 +350,20 @@ export async function createFramework(
     const instructionsModule = new InstructionsModule(instructionsConfig);
     if (workspaceModule) instructionsModule.setWorkspace(workspaceModule);
     moduleInstances.push(instructionsModule);
+  }
+
+  // Light public-web verification/acquisition. OPT-IN and deliberately much
+  // narrower than a browser: HTTPS GETs with private-host/size guards, with
+  // optional no-clobber writes into selected project-shell roots.
+  if (modules.webFetch) {
+    const webFetchConfig = typeof modules.webFetch === 'object' ? modules.webFetch : {};
+    const { downloadRoots: downloadRootNames, ...fetchLimits } = webFetchConfig;
+    const downloadRoots = downloadRootNames?.map((name) => {
+      const root = modules.projectShell?.roots.find((candidate) => candidate.name === name);
+      if (!root) throw new Error(`Unknown project-shell download root: ${name}`);
+      return { ...root, path: resolve(root.path) };
+    });
+    moduleInstances.push(new WebFetchModule({ ...fetchLimits, downloadRoots }));
   }
 
   // Activity (typing indicators) — opt-in per recipe
@@ -473,6 +507,7 @@ export async function createFramework(
       if (recipeEntry.reconnect !== undefined) merged.reconnect = recipeEntry.reconnect;
       if (recipeEntry.reconnectIntervalMs !== undefined) merged.reconnectIntervalMs = recipeEntry.reconnectIntervalMs;
       if (recipeEntry.reconnectMaxIntervalMs !== undefined) merged.reconnectMaxIntervalMs = recipeEntry.reconnectMaxIntervalMs;
+      if (recipeEntry.hostImageTriage !== undefined) merged.hostImageTriage = recipeEntry.hostImageTriage;
       // Let a recipe override/adopt WebSocket transport for a file-defined server.
       if (recipeEntry.url !== undefined) merged.url = recipeEntry.url;
       if (recipeEntry.transport !== undefined) merged.transport = recipeEntry.transport;

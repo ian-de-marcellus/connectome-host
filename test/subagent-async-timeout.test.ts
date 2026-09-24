@@ -22,7 +22,7 @@ import type { Module, ToolCall } from '@animalabs/agent-framework';
 import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
 import { SubagentModule } from '../src/modules/subagent-module.js';
 
-async function makeHarness(opts: { maxExecutionMs: number; subagentRunMs: number }) {
+async function makeHarness(opts: { maxExecutionMs: number; subagentRunMs: number; maxConcurrent?: number }) {
   const tmpDir = mkdtempSync(join(tmpdir(), 'sub-timeout-'));
   const adapter = new MockAdapter({ defaultResponse: 'ok' });
   const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
@@ -31,6 +31,7 @@ async function makeHarness(opts: { maxExecutionMs: number; subagentRunMs: number
     defaultModel: 'mock',
     defaultMaxTokens: 256,
     maxExecutionMs: opts.maxExecutionMs,
+    maxConcurrent: opts.maxConcurrent,
     maxRetries: 0, // don't let retries mask the timeout result
   });
   const framework = await AgentFramework.create({
@@ -105,13 +106,16 @@ type InternalSubagent = SubagentModule & {
 async function makeBudgetHarness(opts: {
   parentMaxTokens: number;
   moduleDefaultMaxTokens?: number;
+  moduleDefaultModel?: string;
+  allowedModels?: string[];
 }) {
   const tmpDir = mkdtempSync(join(tmpdir(), 'sub-budget-'));
   const adapter = new MockAdapter({ defaultResponse: 'ok' });
   const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
   const subagent = new SubagentModule({
     parentAgentName: 'parent',
-    defaultModel: 'mock',
+    defaultModel: opts.moduleDefaultModel ?? 'mock',
+    allowedModels: opts.allowedModels,
     defaultMaxTokens: opts.moduleDefaultMaxTokens,
     maxRetries: 0,
   });
@@ -127,9 +131,9 @@ async function makeBudgetHarness(opts: {
     modules: [subagent as unknown as Module],
   });
 
-  const captured: Array<{ name: string; maxTokens: number }> = [];
+  const captured: Array<{ name: string; model: string; maxTokens: number }> = [];
   const fw = framework as unknown as {
-    createEphemeralAgent: (config: { name: string; maxTokens: number; [k: string]: unknown }) => Promise<{
+    createEphemeralAgent: (config: { name: string; model: string; maxTokens: number; [k: string]: unknown }) => Promise<{
       agent: { name: string; maxTokens: number };
       contextManager: { addMessage: (...a: unknown[]) => void; compile: () => Promise<{ messages: unknown[] }> };
       cleanup: () => void;
@@ -140,7 +144,7 @@ async function makeBudgetHarness(opts: {
   };
   const originalCreate = fw.createEphemeralAgent.bind(fw);
   fw.createEphemeralAgent = async (config) => {
-    captured.push({ name: config.name, maxTokens: config.maxTokens });
+    captured.push({ name: config.name, model: config.model, maxTokens: config.maxTokens });
     return originalCreate(config);
   };
   fw.runEphemeralToCompletion = (agent: unknown) => {
@@ -167,6 +171,46 @@ async function makeBudgetHarness(opts: {
 }
 
 describe('SubagentModule timeout behaviour (async vs sync default)', () => {
+  test('accepted async work waits for a free slot and reports its queue position', async () => {
+    const { subagent, cleanup } = await makeHarness({
+      maxExecutionMs: 1_000,
+      subagentRunMs: 150,
+      maxConcurrent: 1,
+    });
+    try {
+      const first = await subagent.handleToolCall(makeToolCall('spawn', {
+        name: 'slot-holder',
+        systemPrompt: 'you are a test subagent',
+        task: 'hold the only slot briefly',
+      }));
+      expect(first.success).toBe(true);
+
+      const second = await subagent.handleToolCall(makeToolCall('spawn', {
+        name: 'queued-worker',
+        systemPrompt: 'you are a test subagent',
+        task: 'run when the slot is free',
+        timeoutMs: 500,
+      }));
+      expect(second.success).toBe(true);
+      const receipt = typeof second.data === 'string' ? second.data : JSON.stringify(second.data);
+      expect(receipt).toMatch(/queued at position 1/i);
+      expect(receipt).toMatch(/no admission timeout/i);
+
+      const handles = (subagent as unknown as InternalSubagent).asyncHandles;
+      const firstHandle = handles.get('slot-holder');
+      const secondHandle = handles.get('queued-worker');
+      expect(firstHandle).toBeDefined();
+      expect(secondHandle).toBeDefined();
+
+      await expect(firstHandle!.promise).resolves.toMatchObject({ summary: 'ok' });
+      await expect(secondHandle!.promise).resolves.toMatchObject({
+        summary: expect.stringMatching(/Concurrency notice: this agent waited/),
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 10_000);
+
   test('ASYNC spawn, no explicit timeoutMs, subagent runs longer than maxExecutionMs', async () => {
     const MAX_EXEC = 1_000;
     const SUBAGENT_WORK = 3_000;
@@ -374,6 +418,73 @@ describe('SubagentModule maxTokens cascade', () => {
       expect(res.success).toBe(true);
       expect(captured.length).toBe(1);
       expect(captured[0].maxTokens).toBe(8_000);
+    } finally {
+      await cleanup();
+    }
+  }, 10_000);
+
+  test('model policy is visible in schemas and rejects models outside the allowlist', async () => {
+    const allowedModels = ['haiku-test', 'sonnet-test', 'opus-test'];
+    const subagent = new SubagentModule({
+      defaultModel: 'sonnet-test',
+      allowedModels,
+      defaultMaxTokens: 8_192,
+    });
+
+    for (const toolName of ['spawn', 'fork']) {
+      const tool = subagent.getTools().find((candidate) => candidate.name === toolName);
+      const modelSchema = (tool?.inputSchema.properties as Record<string, Record<string, unknown>>).model;
+      expect(modelSchema.enum).toEqual(allowedModels);
+      expect(String(modelSchema.description)).toContain('sonnet-test');
+      expect(String(modelSchema.description)).toContain('default');
+    }
+
+    const rejected = await subagent.handleToolCall(makeToolCall('spawn', {
+      name: 'too-expensive-mystery',
+      systemPrompt: 'sp',
+      task: 'reply',
+      model: 'unknown-test',
+    }));
+    expect(rejected.success).toBe(false);
+    expect(rejected.error).toContain('not allowed');
+    expect(rejected.error).toContain('haiku-test, sonnet-test, opus-test');
+  });
+
+  test('default and explicit model choices reach the provider and appear in launch receipts', async () => {
+    const allowedModels = ['haiku-test', 'sonnet-test', 'opus-test'];
+    const { subagent, captured, cleanup } = await makeBudgetHarness({
+      parentMaxTokens: 12_345,
+      moduleDefaultModel: 'sonnet-test',
+      moduleDefaultMaxTokens: 8_192,
+      allowedModels,
+    });
+    try {
+      const defaultAck = await subagent.handleToolCall(makeToolCall('spawn', {
+        name: 'default-model',
+        systemPrompt: 'sp',
+        task: 'reply',
+      }));
+      expect(defaultAck.success).toBe(true);
+      expect(String(defaultAck.data)).toContain('sonnet-test');
+      expect(String(defaultAck.data)).toContain('8,192');
+      expect(String(defaultAck.data)).toContain('Fresh context');
+
+      const explicit = await subagent.handleToolCall(makeToolCall('fork', {
+        name: 'explicit-model',
+        task: 'reply',
+        model: 'haiku-test',
+        maxTokens: 4_096,
+        sync: true,
+      }));
+      expect(explicit.success).toBe(true);
+
+      const defaultHandle = (subagent as unknown as InternalSubagent).asyncHandles.get('default-model');
+      await defaultHandle?.promise;
+
+      expect(captured.map(({ model, maxTokens }) => ({ model, maxTokens }))).toEqual([
+        { model: 'sonnet-test', maxTokens: 8_192 },
+        { model: 'haiku-test', maxTokens: 4_096 },
+      ]);
     } finally {
       await cleanup();
     }
