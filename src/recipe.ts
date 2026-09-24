@@ -662,6 +662,21 @@ export interface RecipeModules {
     downloadRoots?: string[];
   };
   /**
+   * memory--trace: trace a passage from one of the agent's memories back to
+   * what it was made from (read-only). OPT-IN. Large traces go to a
+   * temporary scratch dir (default <data>/memory-traces), pruned after
+   * ttlDays (default 7); results above inlineMaxTokens (default 8000) are
+   * always written to a file.
+   */
+  memoryTrace?: boolean | {
+    scratchDir?: string;
+    ttlDays?: number;
+    inlineMaxTokens?: number;
+    maxResults?: number;
+    /** Render scratch paths as the agent's workspace names them. */
+    displayRoot?: { path: string; as: string };
+  };
+  /**
    * Subagent forking (spawn/fork parallel agents). OPT-IN — defaults to off
    * and is not part of the standard recipe.
    */
@@ -2256,6 +2271,27 @@ export function validateRecipe(raw: unknown): Recipe {
           }
           if (seenDownloadRoots.has(name)) throw new Error(`Duplicate web-fetch download root: ${name}`);
           seenDownloadRoots.add(name);
+        }
+      }
+    }
+    if (mods.memoryTrace !== undefined && typeof mods.memoryTrace !== 'boolean') {
+      if (!mods.memoryTrace || typeof mods.memoryTrace !== 'object' || Array.isArray(mods.memoryTrace)) {
+        throw new Error('modules.memoryTrace must be a boolean or object.');
+      }
+      const mt = mods.memoryTrace as Record<string, unknown>;
+      if (mt.scratchDir !== undefined && (typeof mt.scratchDir !== 'string' || !mt.scratchDir.trim())) {
+        throw new Error('modules.memoryTrace.scratchDir must be a non-empty string.');
+      }
+      if (mt.displayRoot !== undefined) {
+        const dr = mt.displayRoot as Record<string, unknown> | null;
+        if (!dr || typeof dr !== 'object' || typeof dr.path !== 'string' || typeof dr.as !== 'string' || !dr.path || !dr.as) {
+          throw new Error('modules.memoryTrace.displayRoot must be { path: string, as: string }.');
+        }
+      }
+      for (const key of ['ttlDays', 'inlineMaxTokens', 'maxResults']) {
+        if (mt[key] !== undefined &&
+            (typeof mt[key] !== 'number' || !Number.isInteger(mt[key]) || (mt[key] as number) < 1)) {
+          throw new Error(`modules.memoryTrace.${key} must be a positive integer.`);
         }
       }
     }

@@ -51,6 +51,7 @@ import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
 import { WebUiModule } from './modules/web-ui-module.js';
 import { WebFetchModule } from './modules/web-fetch-module.js';
+import { MemoryTraceModule } from './modules/memory-trace-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
@@ -373,6 +374,21 @@ export async function createFramework(
     moduleInstances.push(new WebFetchModule({ ...fetchLimits, downloadRoots }));
   }
 
+  // memory--trace: read-only tracing of a memory back to its sources. OPT-IN.
+  let memoryTraceModule: MemoryTraceModule | null = null;
+  if (modules.memoryTrace) {
+    const mt = typeof modules.memoryTrace === 'object' ? modules.memoryTrace : {};
+    memoryTraceModule = new MemoryTraceModule({
+      scratchDir: mt.scratchDir ?? resolve(storePath, '..', '..', 'memory-traces'),
+      ttlDays: mt.ttlDays,
+      inlineMaxTokens: mt.inlineMaxTokens,
+      maxResults: mt.maxResults,
+      ...(mt.displayRoot ? { displayRoot: mt.displayRoot } : {}),
+      timeZone,
+    });
+    moduleInstances.push(memoryTraceModule);
+  }
+
   // Activity (typing indicators) — opt-in per recipe
   let activityModule: ActivityModule | null = null;
   if (modules.activity !== undefined && modules.activity !== false) {
@@ -619,6 +635,19 @@ export async function createFramework(
 
   // Wire post-creation hooks
   residentLifecycleModule?.setFramework(framework);
+  memoryTraceModule?.setSource((caller) => {
+    const agent = framework.getAgent(caller ?? agentName) ?? framework.getAgent(agentName);
+    if (!agent) return null;
+    const cm = agent.getContextManager() as unknown as {
+      getStrategy(): { summaries?: unknown[] };
+      getMessageCount(): number;
+      getMessageWindow(start: number, end: number, opts: { resolveBlobs: boolean }): { messages: unknown[] };
+    };
+    return {
+      summaries: () => (cm.getStrategy().summaries ?? []) as never,
+      messages: () => cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages as never,
+    };
+  });
 
   // HistoryModule needs the live ContextManager (only obtainable via the
   // agent, post-creation) and the framework's ChannelRegistry (null when no
