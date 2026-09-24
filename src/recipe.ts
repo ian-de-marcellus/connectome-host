@@ -119,6 +119,8 @@ export interface RecipeStrategy {
   mergeSourceLevelSummaryIds?: string[];
   /** Context Manager: with compressionScopeMarkers, still show merges earlier summaries as context. */
   compressionMergeRecall?: boolean;
+  /** Context Manager: live view shows skip_reply reasons on the result side (see context-manager). */
+  liveSkipReasonInResult?: boolean;
   summaryTargetTokens?: number;
   /** Standing production target: keep the summary forest deep enough to fit
    *  this budget, enabling a later live-budget descent with no fold-storm and
