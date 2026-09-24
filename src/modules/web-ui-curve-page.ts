@@ -88,6 +88,15 @@ svg text{font:11px ui-monospace,Menlo,monospace;fill:var(--muted)}
 .entry .imgs{color:var(--muted);font-size:12px;padding:0 14px 10px}
 .note{color:var(--muted);font-size:13px;margin:6px 0 0}
 #status{color:var(--muted);padding:40px 0;text-align:center}
+.rawbtn{margin:6px 12px 10px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer;border:1px solid currentColor;border-radius:6px;background:transparent;color:inherit;opacity:.85}
+.rawbtn:hover{opacity:1}
+.raws{margin:0 12px 12px;border-left:3px solid var(--c-raw, #888);padding-left:10px}
+.raws .msg{margin:10px 0}
+.raws .mh{font-size:12px;opacity:.75;margin-bottom:3px}
+.raws .blk{margin:4px 0}
+.raws .bl{font-size:11px;text-transform:uppercase;letter-spacing:.04em;opacity:.7}
+.raws .blk.thinking pre,.raws .blk.redacted_thinking pre{font-style:italic;opacity:.85}
+.raws .blk.tool_use pre,.raws .blk.tool_result pre{opacity:.9;max-height:22em;overflow:auto}
 </style>
 </head>
 <body>
@@ -225,8 +234,36 @@ document.getElementById('list').innerHTML = D.map(e => {
     '<span class="stat mono">'+fmt(e.rawCovered)+'→'+fmt(e.rendered)+' ('+r+':1)'+(e.dateFirst ? ' · '+date(e.dateFirst) : '')+'</span>' +
     '<p class="peek">'+esc(e.text.slice(0,180))+'</p></summary>' +
   (e.nImages ? '<div class="imgs">［'+e.nImages+' inline image'+(e.nImages>1?'s':'')+' not shown in this dump］</div>' : '') +
-  '<pre>'+esc(e.text)+'</pre></details>';
+  '<pre>'+esc(e.text)+'</pre>' +
+  (e.kind !== 'raw' && e.id ? '<button class="rawbtn" data-sid="'+esc(e.id)+'">show raw messages ('+e.msgCount+')</button><div class="raws" hidden></div>' : '') +
+  '</details>';
 }).join('');
+
+// ---- raw messages under a summary ----
+document.getElementById('list').addEventListener('click', async ev => {
+  const b = ev.target.closest('.rawbtn'); if (!b) return;
+  const box = b.nextElementSibling;
+  if (!box.hidden && box.dataset.loaded) { box.hidden = true; b.textContent = b.textContent.replace('hide', 'show'); return; }
+  if (box.dataset.loaded) { box.hidden = false; b.textContent = b.textContent.replace('show', 'hide'); return; }
+  b.disabled = true; b.textContent = 'loading…';
+  try {
+    const q = new URLSearchParams(location.search); q.set('summary', b.dataset.sid);
+    const res = await fetch('/debug/context/raws?' + q, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (await res.text()).slice(0, 200));
+    const r = await res.json();
+    const lbl = { text: '', thinking: 'thinking', redacted_thinking: 'redacted thinking', tool_use: 'tool call', tool_result: 'tool result', image: 'image' };
+    box.innerHTML = '<div class="mh">' + r.found + ' of ' + r.leafCount + ' raw message' + (r.leafCount === 1 ? '' : 's') + ' under ' + esc(r.summary.id) + '</div>' +
+      r.messages.map(m => '<div class="msg"><div class="mh"><b>' + esc(m.participant) + '</b> · ' + date(m.timestamp) + ' · <span class="mono">' + esc(m.id) + '</span></div>' +
+        m.blocks.map(x => '<div class="blk ' + x.type + '">' +
+          (x.type === 'text' ? '' : '<div class="bl">' + (lbl[x.type] ?? x.type) + (x.name ? ' · ' + esc(x.name) : '') + (x.signed ? ' · signed' : '') + (x.isError ? ' · error' : '') + '</div>') +
+          (x.text !== undefined && x.text !== '' ? '<pre>' + esc(x.text) + '</pre>' : (x.type === 'thinking' ? '<pre>(no visible text)</pre>' : '')) +
+        '</div>').join('') + '</div>').join('');
+    box.dataset.loaded = '1'; box.hidden = false;
+    b.textContent = 'hide raw messages (' + r.found + ')';
+  } catch (e) {
+    b.textContent = 'failed: ' + e.message;
+  } finally { b.disabled = false; }
+});
 
 // ---- filters ----
 const fl = document.getElementById('filters');

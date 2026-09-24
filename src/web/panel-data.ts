@@ -1232,6 +1232,59 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
 }
 
 /**
+ * Raw messages underneath one summary (L1 → its chunk; L2+ → expanded to
+ * leaves), for the /curve page's "show raw messages" button. Read-only; no
+ * compile, blobs not resolved (images are reported, not inlined).
+ *
+ *   GET /debug/context/raws?summary=<id>[&agent=<name>]
+ */
+export function buildSummaryRaws(app: PanelAppRef, agentName: string, summaryId: string): Record<string, unknown> {
+  requireAgent(app, agentName);
+  const agent = app.framework.getAgent(agentName)!;
+  const cm = (agent as unknown as { getContextManager: () => any }).getContextManager();
+  type Summary = { id: string; level: number; sourceLevel: number; sourceIds: string[] };
+  const sums: Summary[] = (cm.getStrategy() as { summaries?: Summary[] }).summaries ?? [];
+  const sumById = new Map(sums.map((x) => [x.id, x]));
+  const target = sumById.get(summaryId);
+  if (!target) throw new Error(`unknown summary ${summaryId}`);
+  const leaves = (x: Summary, seen = new Set<string>()): string[] => {
+    if (seen.has(x.id)) return [];
+    seen.add(x.id);
+    if (x.sourceLevel === 0) return x.sourceIds;
+    const out: string[] = [];
+    for (const cid of x.sourceIds) {
+      const c = sumById.get(cid);
+      if (c) out.push(...leaves(c, seen));
+    }
+    return out;
+  };
+  const want = new Set(leaves(target));
+  const messageCount = cm.getMessageCount();
+  const all: Array<{ id: string; participant?: string; timestamp?: unknown; content?: unknown[] }> =
+    cm.getMessageWindow(0, messageCount, { resolveBlobs: false }).messages;
+  const flat = (v: unknown): string => typeof v === 'string' ? v
+    : Array.isArray(v) ? v.map((b: any) => b?.type === 'text' ? String(b.text ?? '') : b?.type === 'image' ? '[image]' : JSON.stringify(b)).join('\n')
+    : JSON.stringify(v ?? '');
+  const messages = all.filter((mm) => want.has(mm.id)).map((mm) => ({
+    id: mm.id,
+    participant: mm.participant ?? '',
+    timestamp: mm.timestamp ?? null,
+    blocks: ((mm.content ?? []) as Array<Record<string, unknown>>).map((b) => {
+      switch (b?.type) {
+        case 'text': return { type: 'text', text: String(b.text ?? '') };
+        case 'thinking': return { type: 'thinking', text: String(b.thinking ?? ''), signed: typeof b.signature === 'string' && b.signature.length > 0 };
+        case 'redacted_thinking': return { type: 'redacted_thinking' };
+        case 'tool_use': return { type: 'tool_use', name: String(b.name ?? ''), text: JSON.stringify(b.input ?? {}, null, 2) };
+        case 'tool_result': return { type: 'tool_result', text: flat(b.content), isError: b.is_error === true || b.isError === true };
+        case 'image': return { type: 'image' };
+        default: return { type: String(b?.type ?? 'unknown'), text: JSON.stringify(b) };
+      }
+    }),
+  }));
+  return { agent: agentName, summary: { id: target.id, level: target.level, sourceIds: target.sourceIds }, leafCount: want.size, found: messages.length, messages };
+}
+
+/**
  * Single-flight + cooldown for preview, PER PROCESS.
  *
  * A preview is a real compile: ~8s on a large store, and `select()` is

@@ -91,6 +91,7 @@ import {
   buildContextCoverage,
   buildContextMakeup,
   buildContextCurve,
+  buildSummaryRaws,
   buildContextMaintenance,
   runContextPreview,
   buildDebugContext,
@@ -1112,6 +1113,17 @@ export class WebUiModule implements Module {
     // JSON at /debug/context/curve; the visualization page at /curve.
     if (url.pathname === '/debug/context/curve') {
       return this.handleContextCurve(url);
+    }
+    if (url.pathname === '/debug/context/raws') {
+      const app = this.panelApp();
+      if (!app) return new Response('Not ready', { status: 503 });
+      const summaryId = url.searchParams.get('summary');
+      if (!summaryId) return new Response('summary= required', { status: 400 });
+      try {
+        return Response.json(buildSummaryRaws(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined), summaryId));
+      } catch (err) {
+        return panelErrorResponse(err);
+      }
     }
     if (url.pathname === '/debug/context/coverage') {
       return this.handleContextCoverage(url);
