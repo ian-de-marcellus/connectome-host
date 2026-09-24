@@ -115,6 +115,8 @@ export interface RecipeStrategy {
   mergeHoldSummaryIds?: string[];
   /** Context Manager: hold all merge execution (queue kept). */
   mergePaused?: boolean;
+  /** Context Manager: merge sources shown as themselves instead of expanded one level deeper. */
+  mergeSourceLevelSummaryIds?: string[];
   /** Context Manager: with compressionScopeMarkers, still show merges earlier summaries as context. */
   compressionMergeRecall?: boolean;
   summaryTargetTokens?: number;

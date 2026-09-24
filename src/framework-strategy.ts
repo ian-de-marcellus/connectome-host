@@ -33,6 +33,7 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'mergeAttemptLimit',
   'mergeHoldSummaryIds',
   'mergePaused',
+  'mergeSourceLevelSummaryIds',
   'compressionMergeRecall',
   'summaryTargetTokens',
   'productionBudgetTokens',
