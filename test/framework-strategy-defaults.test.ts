@@ -121,6 +121,22 @@ describe('standard-recipe memory defaults', () => {
     expect(configView(omitted).productionBudgetTokens).toBeUndefined();
   });
 
+  test('resident cache TTL is inherited by internal compression requests', () => {
+    const oneHour = buildFrameworkStrategy(
+      recipe({ name: 'Mira', cacheTtl: '1h' }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    expect(configView(oneHour).compressionCacheTtl).toBe('1h');
+
+    const fiveMinutes = buildFrameworkStrategy(
+      recipe({ name: 'Mira', cacheTtl: '5m' }),
+      'some-model',
+      'America/Los_Angeles',
+    );
+    expect(configView(fiveMinutes).compressionCacheTtl).toBe('5m');
+  });
+
   test('explicit recipe values override the defaults', () => {
     const strategy = buildFrameworkStrategy(
       recipe({

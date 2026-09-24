@@ -85,6 +85,10 @@ export function buildFrameworkStrategy(
     headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
     recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
     compressionModel: strategyConfig?.compressionModel ?? model,
+    // Compression calls share the resident's prompt-cache lifetime.
+    ...(recipe.agent.cacheTtl !== undefined
+      ? { compressionCacheTtl: recipe.agent.cacheTtl }
+      : {}),
     ...(strategyConfig?.compressionMaxTokens !== undefined
       ? { compressionMaxTokens: strategyConfig.compressionMaxTokens }
       : {}),
