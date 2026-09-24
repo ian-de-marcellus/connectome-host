@@ -109,6 +109,10 @@ export interface RecipeStrategy {
   targetChunkTokens?: number;
   mergeThreshold?: number;
   mergeMaxSourceSpanMessages?: number;
+  /** Context Manager: rejected-attempt limit before a merge is quarantined (default 5). */
+  mergeAttemptLimit?: number;
+  /** Context Manager operator merge holds: summary ids never offered as merge sources. */
+  mergeHoldSummaryIds?: string[];
   summaryTargetTokens?: number;
   /** Standing production target: keep the summary forest deep enough to fit
    *  this budget, enabling a later live-budget descent with no fold-storm and

@@ -30,6 +30,8 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'targetChunkTokens',
   'mergeThreshold',
   'mergeMaxSourceSpanMessages',
+  'mergeAttemptLimit',
+  'mergeHoldSummaryIds',
   'summaryTargetTokens',
   'productionBudgetTokens',
   'l1BudgetTokens',
