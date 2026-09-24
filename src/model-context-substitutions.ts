@@ -54,9 +54,16 @@ interface LiteralSubstitutionRuleFile {
   id: string;
   find: string;
   replacement: string;
+  /** Limit the replacement to selected provider call kinds (default: both). */
+  kinds?: SubstitutionKind[];
 }
 
-interface LiteralSubstitutionRule extends LiteralSubstitutionRuleFile {}
+interface LiteralSubstitutionRule {
+  id: string;
+  find: string;
+  replacement: string;
+  kinds: Set<SubstitutionKind>;
+}
 
 type SubstitutionKind = 'complete' | 'stream';
 
@@ -282,12 +289,17 @@ function loadRules(configPath: string): {
     if (typeof candidate.replacement !== 'string') {
       throw new Error(`Model-context literal replacement ${candidate.id} has an invalid replacement`);
     }
+    const kinds = candidate.kinds ?? ['complete', 'stream'];
+    if (!Array.isArray(kinds) || kinds.length === 0 || kinds.some((kind) => kind !== 'complete' && kind !== 'stream')) {
+      throw new Error(`Model-context literal replacement ${candidate.id} has invalid kinds`);
+    }
     seenIds.add(candidate.id);
     seenLiterals.add(candidate.find);
     return {
       id: candidate.id,
       find: candidate.find,
       replacement: candidate.replacement,
+      kinds: new Set(kinds),
     };
   });
   const rangeRules = loadRangeRules(raw.ranges, configPath, seenIds);
@@ -370,6 +382,7 @@ function transformValue(
       dropSiblingThinking = rule.dropSiblingThinking;
     }
     for (const literalRule of literalRules) {
+      if (kind && !literalRule.kinds.has(kind)) continue;
       if (!output.includes(literalRule.find)) continue;
       matched.add(literalRule.id);
       output = output.split(literalRule.find).join(literalRule.replacement);
