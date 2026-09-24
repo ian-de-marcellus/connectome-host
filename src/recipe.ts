@@ -668,6 +668,8 @@ export interface RecipeModules {
    * ttlDays (default 7); results above inlineMaxTokens (default 8000) are
    * always written to a file.
    */
+  /** Operator notes delivered once at host start (default on; inert unless files exist). */
+  pendingNotes?: boolean | { dir?: string };
   memoryTrace?: boolean | {
     scratchDir?: string;
     ttlDays?: number;
@@ -2272,6 +2274,12 @@ export function validateRecipe(raw: unknown): Recipe {
           if (seenDownloadRoots.has(name)) throw new Error(`Duplicate web-fetch download root: ${name}`);
           seenDownloadRoots.add(name);
         }
+      }
+    }
+    if (mods.pendingNotes !== undefined && typeof mods.pendingNotes !== 'boolean') {
+      const pn = mods.pendingNotes as Record<string, unknown>;
+      if (!pn || typeof pn !== 'object' || Array.isArray(pn) || (pn.dir !== undefined && typeof pn.dir !== 'string')) {
+        throw new Error('Recipe modules.pendingNotes must be a boolean or { dir?: string }.');
       }
     }
     if (mods.memoryTrace !== undefined && typeof mods.memoryTrace !== 'boolean') {

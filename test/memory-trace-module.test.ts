@@ -159,3 +159,33 @@ describe('delivery and scratch', () => {
     expect(res.success).toBe(false);
   });
 });
+
+describe('too recent to be memory', () => {
+  const tail: TraceMessage[] = [
+    ...messages,
+    msg('m7', 'Ian', 30, 'This morning: the kettle sings in B flat when the window is open.'),
+  ];
+  const recentSource: TraceSource = { summaries: () => summaries, messages: () => tail };
+
+  test('a quote found only in the unsummarized tail says it is too recent, not a misquote', () => {
+    const out = traceQuote(recentSource, { quote: 'the kettle sings in B flat when the window is open' }, opts);
+    expect(out.kind).toBe('recent');
+    expect(out.text).toContain('too recent to be memory yet');
+    expect(out.text).toContain('message m7');
+    expect(out.text).not.toContain('misquoting');
+  });
+
+  test('a true miss names all three possibilities', () => {
+    const out = traceQuote(recentSource, { quote: 'the candle burned down to nothing overnight' }, opts);
+    expect(out.kind).toBe('miss');
+    expect(out.text).toContain("isn't in your memory at all");
+    expect(out.text).toContain('misquoting your own past');
+    expect(out.text).toContain('too recent to have been summarized');
+  });
+
+  test('raw text inside already-summarized spans does not count as recent', () => {
+    // m4's wording differs from its L1; it is covered, so it is not "recent".
+    const out = traceQuote(recentSource, { quote: 'The spectrogram is a wall of sound at 4:47.' }, opts);
+    expect(out.kind).not.toBe('recent');
+  });
+});

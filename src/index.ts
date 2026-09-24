@@ -52,6 +52,7 @@ import { ChannelModeModule } from './modules/channel-mode-module.js';
 import { WebUiModule } from './modules/web-ui-module.js';
 import { WebFetchModule } from './modules/web-fetch-module.js';
 import { MemoryTraceModule } from './modules/memory-trace-module.js';
+import { PendingNotesModule } from './modules/pending-notes-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
@@ -387,6 +388,16 @@ export async function createFramework(
       timeZone,
     });
     moduleInstances.push(memoryTraceModule);
+  }
+
+  // Pending operator notes (<resident>/pending/notes/*.md), delivered once at
+  // start as context-only messages. Inert unless files exist; opt out with
+  // modules.pendingNotes: false.
+  if (modules.pendingNotes !== false) {
+    const pn = typeof modules.pendingNotes === 'object' ? modules.pendingNotes : {};
+    moduleInstances.push(new PendingNotesModule({
+      notesDir: pn.dir ? resolve(pn.dir) : resolve(storePath, '..', '..', '..', 'pending', 'notes'),
+    }));
   }
 
   // Activity (typing indicators) — opt-in per recipe

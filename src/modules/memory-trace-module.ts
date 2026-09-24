@@ -257,7 +257,7 @@ function descend(quote: string, s: TraceSummary, c: Ctx, depth: 'one' | 'raw', i
 // ---------------------------------------------------------------------------
 
 export interface TraceOutcome {
-  kind: 'match' | 'multiple' | 'miss';
+  kind: 'match' | 'multiple' | 'miss' | 'recent';
   text: string;
   /** Raw-line body for a scratch file (same as text; kept separate for clarity). */
   matchedIds: string[];
@@ -286,11 +286,37 @@ export function traceQuote(
   if (input.memoryId) matches = matches.filter((x) => x.s.id === input.memoryId);
 
   if (matches.length === 0) {
+    // Before raising the misquote alarm, check the recent conversation that
+    // hasn't been summarized yet: a passage from this morning is experience,
+    // not memory, and finding it there is expected, not a confabulation.
+    if (!input.memoryId) {
+      const covered = new Set<string>();
+      for (const s of summaries) if (s.level === 1 && s.sourceLevel === 0) for (const id of s.sourceIds) covered.add(id);
+      let lastCovered = -1;
+      for (const id of covered) lastCovered = Math.max(lastCovered, order.get(id) ?? -1);
+      const recent = messages.slice(lastCovered + 1)
+        .map((m) => ({ m, sc: scorePassage(quote, messageText(m)) }))
+        .filter((x) => x.sc >= MATCH_THRESHOLD)
+        .sort((a, b) => b.sc - a.sc);
+      if (recent.length > 0) {
+        const lines = [HEADER, '',
+          'FOUND IN YOUR RECENT CONVERSATION — too recent to be memory yet. This passage has not been ' +
+          'summarized into any memory; it is still part of your raw recent history. That is expected, not a misquote.',
+          ''];
+        for (const { m } of recent.slice(0, opts.maxResults)) {
+          lines.push(`  ${fmt(m.timestamp)} · ${m.participant ?? '?'} · message ${m.id}`,
+            `    "${bestSnippet(quote, messageText(m))}"`);
+        }
+        return { kind: 'recent', text: lines.join('\n'), matchedIds: recent.map((x) => x.m.id) };
+      }
+    }
     const lines = [HEADER, '',
       input.memoryId
         ? `NO MATCH in ${input.memoryId}. That memory does not contain this passage.`
-        : 'NO MATCH. None of your memories contains this passage. You may be misquoting your own past — ' +
-          'check the wording against the closest passages below before relying on it.',
+        : 'NO MATCH. None of your memories contains this passage, and it is not in your recent unsummarized ' +
+          'conversation either. Possibilities: it isn\'t in your memory at all; you may be misquoting your own ' +
+          'past; or it is from a stretch too recent to have been summarized that your context no longer holds ' +
+          'verbatim. Check the wording against the closest passages below before relying on it.',
       '', 'Closest passages:'];
     for (const { s, sc } of scored.slice(0, opts.maxResults)) {
       lines.push(`  ${label(s, c)} · match ${(sc * 100).toFixed(0)}%`, `    "${bestSnippet(quote, s.content)}"`);
