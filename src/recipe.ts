@@ -62,6 +62,9 @@ export interface RecipeStrategy {
   compressionMergeSourceOnly?: boolean;
   /** Preserve ordinary merge retries, then use target-only on the final attempt. */
   compressionMergeSourceOnlyFallback?: boolean;
+  /** Context Manager `compressionScopeMarkers`: BEGIN/END scope markers around
+   *  the new L1 slice and merge span, no merge recall, silent identity reminder. */
+  compressionScopeMarkers?: boolean;
   /**
    * Context Manager tool-prose hoist rung (default off). On an L1 refusal, retry
    * with long `fromTools` string arguments (e.g. a diary kept in
@@ -1797,6 +1800,7 @@ export function validateRecipe(raw: unknown): Recipe {
       'compressionSourceOnlyFallback',
       'compressionMergeSourceOnly',
       'compressionMergeSourceOnlyFallback',
+      'compressionScopeMarkers',
       'compressionSplitFallback',
       'compressionSplitPlaceholder',
     ] as const) {
