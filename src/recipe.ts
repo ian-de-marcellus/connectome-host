@@ -113,6 +113,10 @@ export interface RecipeStrategy {
   mergeAttemptLimit?: number;
   /** Context Manager operator merge holds: summary ids never offered as merge sources. */
   mergeHoldSummaryIds?: string[];
+  /** Context Manager: hold all merge execution (queue kept). */
+  mergePaused?: boolean;
+  /** Context Manager: with compressionScopeMarkers, still show merges earlier summaries as context. */
+  compressionMergeRecall?: boolean;
   summaryTargetTokens?: number;
   /** Standing production target: keep the summary forest deep enough to fit
    *  this budget, enabling a later live-budget descent with no fold-storm and
