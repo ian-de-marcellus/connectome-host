@@ -326,6 +326,9 @@ export async function createFramework(
     // override with SLEEP_PRIVILEGED_FILE. Edit the file to change the list.
     gateOptions.privilegedUsersPath =
       process.env.SLEEP_PRIVILEGED_FILE || resolve('./sleep-privileged.json');
+    if (recipe.agent.messageQuietPeriodMs) {
+      gateOptions.messageQuietPeriod = { quietMs: recipe.agent.messageQuietPeriodMs };
+    }
   }
 
   // Workspace (replaces FilesModule + LocalFilesModule)

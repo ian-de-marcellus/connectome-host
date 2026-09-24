@@ -14,6 +14,8 @@ export type FrameworkAgentConfig = AgentConfig & {
   retirement?: FrameworkRetirementConfig;
   proseDelivery?: 'live' | 'terminal';
   speakingRoom?: { initialChannel: string };
+  proseSilencing?: 'turn' | 'round';
+  failureNotices?: boolean;
 };
 
 /**
@@ -232,6 +234,12 @@ export function buildFrameworkAgentConfig(
       : {}),
     ...(recipe.agent.proseDelivery !== undefined
       ? { proseDelivery: recipe.agent.proseDelivery }
+      : {}),
+    ...(recipe.agent.proseSilencing !== undefined
+      ? { proseSilencing: recipe.agent.proseSilencing }
+      : {}),
+    ...(recipe.agent.failureNotices !== undefined
+      ? { failureNotices: recipe.agent.failureNotices }
       : {}),
   };
 }

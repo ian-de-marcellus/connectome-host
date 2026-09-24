@@ -375,6 +375,12 @@ export interface RecipeAgent {
    *  (default true). Residents whose history already establishes the present
    *  can turn it off. */
   announceSessionStart?: boolean;
+  /** Silencing scope for explicit sends: 'turn' (default) or 'round'. */
+  proseSilencing?: 'turn' | 'round';
+  /** Post an automatic notice in the speaking room when a turn fails. */
+  failureNotices?: boolean;
+  /** Hold message-driven wakes until senders are quiet this long (ms). */
+  messageQuietPeriodMs?: number;
 }
 
 export interface RecipeMcpServer {
@@ -1477,6 +1483,19 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.proseDelivery must be 'live' or 'terminal', got ${JSON.stringify(agent.proseDelivery)}.`);
   }
 
+  if (agent.proseSilencing !== undefined && agent.proseSilencing !== 'turn' && agent.proseSilencing !== 'round') {
+    throw new Error('Recipe agent.proseSilencing must be "turn" or "round".');
+  }
+  if (agent.failureNotices !== undefined && typeof agent.failureNotices !== 'boolean') {
+    throw new Error('Recipe agent.failureNotices must be a boolean.');
+  }
+  if (
+    agent.messageQuietPeriodMs !== undefined &&
+    (typeof agent.messageQuietPeriodMs !== 'number' || !Number.isFinite(agent.messageQuietPeriodMs) ||
+      agent.messageQuietPeriodMs < 0 || agent.messageQuietPeriodMs > 60_000)
+  ) {
+    throw new Error('Recipe agent.messageQuietPeriodMs must be a number from 0 to 60000.');
+  }
   if (agent.announceSessionStart !== undefined && typeof agent.announceSessionStart !== 'boolean') {
     throw new Error('Recipe agent.announceSessionStart must be a boolean.');
   }
