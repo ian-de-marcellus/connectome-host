@@ -1191,14 +1191,22 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
 
   const entries = [];
   let i = 0;
-  for (const e of compiled.messages as Array<{ participant: string; content?: unknown[]; sourceMessageId?: string }>) {
+  let prevText = '';
+  for (const e of compiled.messages as Array<{ participant: string; content?: unknown[]; sourceMessageId?: string; cacheLayoutKey?: string }>) {
     const blocks = (e.content ?? []) as Array<Record<string, unknown>>;
     const text = blocks.filter((b) => b?.type === 'text').map((b) => String(b.text ?? '')).join('\n');
     const nImages = blocks.filter((b) => b?.type === 'image').length;
     const rendered = Math.ceil(text.length / 4) + nImages * 1600 +
       blocks.filter((b) => b?.type === 'tool_result' || b?.type === 'tool_use')
         .reduce((a, b) => a + Math.ceil(JSON.stringify(b.input ?? b.content ?? '').length / 4), 0);
-    const sum = byHead.get(headOf(text));
+    // Identify a summary by its recall header (the entry just before the
+    // answer, rendered from recallHeaderTemplate, e.g. "[Recall L1-99]").
+    // compile() drops entry provenance, and matching by the first 100 chars
+    // mislabels summaries that open identically (observed: 22 L1s sharing
+    // one opening), so text matching is only the fallback.
+    const headerId = prevText.trim().match(/^(?:\[Recall (L\d+-\d+)\]|\[CM\] Recall memory (L\d+-\d+)\.)$/)?.slice(1).find(Boolean);
+    const sum = (headerId ? sumById.get(headerId) : undefined) ?? byHead.get(headOf(text));
+    prevText = text;
     if (sum) {
       const leafIds = leaves(sum).filter((id) => msgById.has(id));
       const rawCovered = leafIds.reduce((a, id) => a + estimate(msgById.get(id)!), 0);
