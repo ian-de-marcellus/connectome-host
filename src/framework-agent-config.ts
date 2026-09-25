@@ -13,7 +13,7 @@ export type FrameworkAgentConfig = AgentConfig & {
   sameRoundThinkTextPolicy?: 'public' | 'private';
   retirement?: FrameworkRetirementConfig;
   proseDelivery?: 'live' | 'terminal';
-  speakingRoom?: { initialChannel: string };
+  speakingRoom?: { initialChannel: string; replyRooms?: string[] };
   proseSilencing?: 'turn' | 'round';
   failureNotices?: boolean;
 };

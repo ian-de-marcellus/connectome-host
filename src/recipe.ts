@@ -382,7 +382,9 @@ export interface RecipeAgent {
   };
   /** Sticky speaking room: ordinary speech lands in the resident's chosen
    *  room every turn; only its own channel_focus/channel_open moves it. */
-  speakingRoom?: { initialChannel: string };
+  /** Sticky speaking room; `replyRooms` lists channel ids whose wakes are
+   *  answered in place for that turn (AF AgentConfig.speakingRoom). */
+  speakingRoom?: { initialChannel: string; replyRooms?: string[] };
   /** Post the synthetic "session started" time message on first wake
    *  (default true). Residents whose history already establishes the present
    *  can turn it off. */
@@ -1532,6 +1534,13 @@ export function validateRecipe(raw: unknown): Recipe {
     const room = agent.speakingRoom as { initialChannel?: unknown } | null;
     if (!room || typeof room !== 'object' || typeof room.initialChannel !== 'string' || !room.initialChannel.trim()) {
       throw new Error('Recipe agent.speakingRoom must be { initialChannel: "<channel id>" }.');
+    }
+    const replyRooms = (room as { replyRooms?: unknown }).replyRooms;
+    if (
+      replyRooms !== undefined &&
+      (!Array.isArray(replyRooms) || !replyRooms.every((id) => typeof id === 'string' && id.trim() !== ''))
+    ) {
+      throw new Error('Recipe agent.speakingRoom.replyRooms must be an array of non-empty channel ids.');
     }
   }
 
