@@ -174,6 +174,13 @@ export interface RecipeStrategy {
    *  names the agent and directs attribution so pure-witness chunks don't
    *  flip the summarizer into another speaker's identity. */
   identityReminder?: string;
+  /** Reminder for WHOLLY inherited targets (L1 chunks entirely before
+   *  witnessedBeforeSequence; merges of all-witnessed sources). Lived and
+   *  mixed targets keep identityReminder (context-manager
+   *  witnessedIdentityReminder). */
+  witnessedIdentityReminder?: string;
+  /** Follow the reminder with an instruction to apply it silently. */
+  identityReminderSilent?: boolean;
 }
 
 export interface RecipeKvUnifiedConfig {

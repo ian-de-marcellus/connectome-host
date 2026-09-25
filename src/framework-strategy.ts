@@ -59,6 +59,8 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'witnessedBeforeSequence',
   'witnessedInstruction',
   'identityReminder',
+  'witnessedIdentityReminder',
+  'identityReminderSilent',
 ];
 
 export function buildFrameworkStrategy(
