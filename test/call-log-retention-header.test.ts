@@ -15,6 +15,7 @@ test('the first line declares retained vs omitted, with the reason; it is not a 
     expect(first.kind).toBeUndefined();
     expect(first.omitted.join(' ')).toContain('request bodies');
     expect(first.why).toContain('out-of-memory');
+    expect(first.goodFor.join(' ')).toContain('what changed between two consecutive calls');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -119,6 +119,12 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         omitted: [
           'request bodies (system prompt, tools, messages) of successful calls',
         ],
+        goodFor: [
+          'cost and cache behaviour of every call (reads, 5m/1h writes, output)',
+          'what changed between two consecutive calls, and where: system, tools, or which message block (prefix fingerprint diff)',
+          'timing: gaps between calls, TTL expiries, restarts (one file per process)',
+          'refusals and errors in full, including the exact request that caused them',
+        ],
         why: 'Serializing full requests on every tool-loop turn held several copies of a large context in memory ' +
           'and contributed to production out-of-memory crashes; successful calls keep a compact summary instead. ' +
           'Consequence: a successful request cannot be reconstructed from this file. Its fingerprint says what ' +
