@@ -765,6 +765,15 @@ export interface CancelSubagentMessage {
   childName?: string;
 }
 
+/** Withdraw a message waiting in the delivery queue (agent-framework prose
+ *  outbox) before it is delivered: its id, or a unique 6+ character prefix
+ *  (GET /debug/outbox lists them). Full-auth clients only; the resident is
+ *  told it was withdrawn. */
+export interface OutboxCancelMessage {
+  type: 'outbox-cancel';
+  id: string;
+}
+
 /** Stop a fleet child gracefully. */
 export interface FleetStopMessage {
   type: 'fleet-stop';
@@ -1079,6 +1088,7 @@ export type WebUiClientMessage =
   | RouteToChildMessage
   | InterruptMessage
   | CancelSubagentMessage
+  | OutboxCancelMessage
   | FleetStopMessage
   | FleetRestartMessage
   | SubscribePeekMessage
@@ -1160,6 +1170,8 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
     case 'cancel-subagent':
       return isNonEmptyString(v.name)
         && (v.childName === undefined || isNonEmptyString(v.childName));
+    case 'outbox-cancel':
+      return isNonEmptyString(v.id);
     case 'fleet-stop':
     case 'fleet-restart':
       return isNonEmptyString(v.name);

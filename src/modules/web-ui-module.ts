@@ -1145,6 +1145,15 @@ export class WebUiModule implements Module {
       return this.handleDebugContext(url);
     }
 
+    // Delivery queue (prose outbox): full status. Same sensitivity tier as
+    // /debug/context (previews are resident words). Withdrawal is the WS
+    // 'outbox-cancel' command (HTTP here is read-only).
+    if (url.pathname === '/debug/outbox') {
+      const fw = this.panelApp()?.framework as unknown as { getOutboxStatus?: () => unknown } | undefined;
+      if (!fw?.getOutboxStatus) return Response.json({ error: 'no delivery queue here' }, { status: 404 });
+      return Response.json(fw.getOutboxStatus() ?? { enabled: false });
+    }
+
     // Inline image bytes for transcript media refs (see serveMedia). Same
     // sensitivity tier as the transcript itself.
     if (url.pathname.startsWith('/media/')) {
@@ -1911,6 +1920,25 @@ export class WebUiModule implements Module {
           lines: [{
             text: ok ? `cancelled subagent ${parsed.name}` : `subagent ${parsed.name} not running`,
             style: ok ? 'system' : 'tool',
+          }],
+        });
+        return;
+      }
+
+      case 'outbox-cancel': {
+        const fw = sharedServer.app.framework as unknown as {
+          cancelOutboxEntry?: (ref: string) => { ok: true; id: string; channelId: string } | { ok: false; reason: string };
+        };
+        if (!fw.cancelOutboxEntry) {
+          this.send(client, { type: 'error', message: 'no delivery queue here' });
+          return;
+        }
+        const r = fw.cancelOutboxEntry(parsed.id);
+        this.send(client, {
+          type: 'command-result',
+          lines: [{
+            text: r.ok ? `withdrew outbox entry ${r.id.slice(0, 8)} (to ${r.channelId}); the resident is told` : `not withdrawn: ${r.reason}`,
+            style: r.ok ? 'system' : 'tool',
           }],
         });
         return;

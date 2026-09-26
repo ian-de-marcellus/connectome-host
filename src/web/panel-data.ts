@@ -701,6 +701,40 @@ export async function buildQuotaSnapshot(app: PanelAppRef): Promise<Record<strin
   };
 }
 
+type OutboxStatus = {
+  enabled: boolean;
+  durable: boolean;
+  pending: Array<{ id: string; conversationId: string; channelId: string; writtenAt: number; attempts: number;
+    outcome: string; attachments: number; notice?: boolean; tool?: string; expiresAt: number }>;
+};
+
+/** Content-free outbox summary for /healthz, or null when the framework has
+ *  no outbox (older framework, or not enabled). */
+export function outboxHealth(app: PanelAppRef, now: number = Date.now()): Record<string, unknown> | null {
+  const fw = app.framework as unknown as { getOutboxStatus?: () => OutboxStatus | null };
+  const s = fw.getOutboxStatus?.();
+  if (!s || !s.enabled) return null;
+  const byAgent: Record<string, number> = {};
+  for (const e of s.pending) byAgent[e.conversationId] = (byAgent[e.conversationId] ?? 0) + 1;
+  return {
+    durable: s.durable,
+    pending: s.pending.length,
+    byAgent,
+    entries: s.pending.map((e) => ({
+      id: e.id.slice(0, 8),
+      agent: e.conversationId,
+      channelId: e.channelId,
+      ageSec: Math.round((now - e.writtenAt) / 1000),
+      attempts: e.attempts,
+      outcome: e.outcome,
+      attachments: e.attachments,
+      ...(e.tool ? { tool: e.tool } : {}),
+      ...(e.notice ? { notice: true } : {}),
+      expiresAt: Number.isFinite(e.expiresAt) ? new Date(e.expiresAt).toISOString() : null,
+    })),
+  };
+}
+
 export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };
   if (typeof fw.healthSnapshot !== 'function') {
@@ -770,6 +804,15 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
       if (rs) composition[name] = rs;
     }
     (snapshot as Record<string, unknown>).contextComposition = composition;
+  } catch {
+    // Health reads never throw.
+  }
+  // Delivery queue (agent-framework prose outbox): what is waiting, content-
+  // free (ids, where, age, attempts, kept files). Full status with previews,
+  // and operator withdrawal, live under /debug/outbox.
+  try {
+    const summary = outboxHealth(app);
+    if (summary) (snapshot as Record<string, unknown>).proseOutbox = summary;
   } catch {
     // Health reads never throw.
   }
