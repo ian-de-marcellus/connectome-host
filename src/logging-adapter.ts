@@ -27,7 +27,7 @@ import type {
   StreamCallbacks,
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
-import { summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
+import { prefixFingerprint, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
 import { loadModelContextSubstitutionsFromEnv } from './model-context-substitutions.js';
 
 /** Live read of the current reasoning setting. The host wires this to
@@ -167,6 +167,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       messages: request.messages.length,
       tools: request.tools?.length ?? 0,
       ...(cache ? { cacheBreakpoints: cache.count, cacheTtls: cache.ttls } : {}),
+      // Content-free (hashes only): lets consecutive calls be diffed to find
+      // what invalidated the cache (see prefixFingerprint).
+      ...(rawRequest ? { prefix: prefixFingerprint(rawRequest) } : {}),
     };
   }
 

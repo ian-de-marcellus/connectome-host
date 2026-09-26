@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * Recent provider-call ledger for the WebUI.
  *
@@ -317,6 +318,51 @@ function parseLoggedCall(record: Record<string, unknown>): ProviderCallRecord | 
 }
 
 /** Content-free cache_control inventory from an actual provider payload. */
+/**
+ * Content-free fingerprint of a raw provider request's prefix, for finding
+ * what invalidates the prompt cache between consecutive calls: hashes only
+ * (never text). A block is hashed WITHOUT its cache_control marker, and
+ * markers are listed separately, so a moved breakpoint shows as a moved
+ * marker, not as changed content.
+ *
+ *   system / tools: 12-hex hashes
+ *   messages[i]:    "<role>|<block types>|<block hashes>", e.g.
+ *                   "assistant|thinking,text|a1b2c3d4e5f6,0f9e8d7c6b5a"
+ *   breakpoints:    positions of cache_control markers ("system", "tools",
+ *                   or "m<i>.<j>" for message i, block j)
+ */
+export function prefixFingerprint(raw: unknown): {
+  system: string; tools: string; messages: string[]; breakpoints: string[];
+} | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const req = raw as { system?: unknown; tools?: unknown; messages?: unknown };
+  if (!Array.isArray(req.messages)) return undefined;
+  const breakpoints: string[] = [];
+  const strip = (v: unknown, where: string): unknown => {
+    if (!v || typeof v !== 'object') return v;
+    if (Array.isArray(v)) return v.map((x) => strip(x, where));
+    const o = v as Record<string, unknown>;
+    if (o.cache_control) breakpoints.push(where);
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(o).sort()) if (k !== 'cache_control') out[k] = strip(o[k], where);
+    return out;
+  };
+  const h = (v: unknown): string => createHash('sha256').update(JSON.stringify(v) ?? '').digest('hex').slice(0, 12);
+  const system = h(strip(req.system, 'system'));
+  const tools = h(strip(req.tools, 'tools'));
+  const messages = (req.messages as Array<{ role?: string; content?: unknown }>).map((m, i) => {
+    const blocks = Array.isArray(m.content) ? m.content : [{ type: 'text', text: m.content }];
+    const types: string[] = [];
+    const hashes: string[] = [];
+    blocks.forEach((b, j) => {
+      types.push(String((b as { type?: unknown })?.type ?? '?'));
+      hashes.push(h(strip(b, `m${i}.${j}`)));
+    });
+    return `${m.role ?? '?'}|${types.join(',')}|${hashes.join(',')}`;
+  });
+  return { system, tools, messages, breakpoints };
+}
+
 export function summarizeCacheControls(raw: unknown): { count: number; ttls: string[] } {
   let count = 0;
   const ttls: string[] = [];
