@@ -94,6 +94,39 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     this.getReasoning = getReasoning;
     this.onCall = onCall;
     this.oauthMode = Boolean(config?.authToken);
+    this.writeRetentionHeader();
+  }
+
+  /**
+   * First line of every log: what this file keeps and what it discards on
+   * purpose, and why. Without it a later reader cannot tell "never captured"
+   * from "captured and dropped", and a silence reads as a gap in the data
+   * instead of a decision someone made. ("Records of the decision not to
+   * record": the Librarian, 2026-09-26.) Readers skip it: it has no `kind`.
+   */
+  private writeRetentionHeader(): void {
+    try {
+      appendFileSync(this.logPath, JSON.stringify({
+        type: 'log-header',
+        timestamp: new Date().toISOString(),
+        schema: 'llm-calls/2',
+        retained: [
+          'per call: timestamp, kind, duration, model, max tokens, message and tool counts',
+          'cache marker count and TTLs; content-free prefix fingerprint (hashes of system, tools and each block; marker positions)',
+          'raw response metadata and usage (response content included)',
+          'full raw request ONLY for refusals and errors',
+        ],
+        omitted: [
+          'request bodies (system prompt, tools, messages) of successful calls',
+        ],
+        why: 'Serializing full requests on every tool-loop turn held several copies of a large context in memory ' +
+          'and contributed to production out-of-memory crashes; successful calls keep a compact summary instead. ' +
+          'Consequence: a successful request cannot be reconstructed from this file. Its fingerprint says what ' +
+          'changed between calls, not what was said.',
+      }) + '\n');
+    } catch {
+      // never throw from logging
+    }
   }
 
   /** Under OAuth subscription auth, prepend the required identity block to the
