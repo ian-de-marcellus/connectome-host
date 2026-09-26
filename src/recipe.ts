@@ -141,6 +141,10 @@ export interface RecipeStrategy {
   kvStableReachTokens?: number;
   /** kv-stable: quality-gap override threshold (§13.4). Default 0.35. */
   kvStableQualityGapRatio?: number;
+  /** kv-stable, opt-in: time memory refolds to the prompt cache (refold when
+   *  it is cold anyway; defer voluntary refolds while warm, letting the
+   *  keepalive lapse). See context-manager kvStableCacheAware. */
+  kvStableCacheAware?: boolean;
   compressionSlackRatio?: number;
   /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
    *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
@@ -294,6 +298,9 @@ export interface RecipeAgent {
     maxIdleHours?: number;
     /** Refresh once untouched this long. Must be < 60 with a 1h TTL. Default 45. */
     refreshAfterMinutes?: number;
+    /** After repeated failures (e.g. exhausted credits), resume after this
+     *  many hours instead of staying off until restart. Default: never. */
+    resumeAfterHours?: number;
   };
   /**
    * Explicit prompt-caching override. Unset means provider-appropriate

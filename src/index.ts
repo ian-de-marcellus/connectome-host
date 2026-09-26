@@ -84,6 +84,7 @@ import {
 import { buildFrameworkStrategy, buildConversationsConfig } from './framework-strategy.js';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { logKeepaliveEvent } from './cache-keepalive-log.js';
+import { PromptCacheClock } from './prompt-cache-clock.js';
 import { loadExtensions } from './extensions.js';
 import { QuotaMeter, AnthropicOAuthQuotaSource, CodexQuotaSource, quotaProviderHold } from './quota-meter.js';
 
@@ -1036,6 +1037,13 @@ async function main() {
         defaultTtl: recipe.agent.cacheTtl ?? '5m',
       })
     : null;
+  // Prompt-cache clock for cache-aware refold timing (strategy.kvStableCacheAware):
+  // seeded from the ledger's replay of earlier logs, so a restart is not "cold".
+  const cacheAware = (recipe.agent.strategy as { kvStableCacheAware?: boolean } | undefined)?.kvStableCacheAware === true;
+  const promptCacheClock = new PromptCacheClock();
+  if (callLedger) promptCacheClock.seed(callLedger.snapshot().rows);
+  // Late-bound: the keepalive is built before the framework exists.
+  let cacheAwareFramework: { isRefoldDeferred?: (name: string) => boolean } | null = null;
   // The Codex subscription adapter owns ChatGPT login/refresh independently
   // of the API-key transports below.
   const codexAdapter = provider === 'openai-codex'
@@ -1233,12 +1241,26 @@ async function main() {
             // all of them land in service-stderr.log next to
             // [inference-refusal]. See cache-keepalive-log.ts for why this is
             // not severity-routed.
-            onEvent: logKeepaliveEvent,
+            ...(recipe.agent.cacheKeepalive?.resumeAfterHours !== undefined
+              ? { resumeAfterMs: recipe.agent.cacheKeepalive.resumeAfterHours * 60 * 60_000 }
+              : {}),
+            // Cache-aware refold timing: don't pay to keep warm a prefix the
+            // next compile will replace (a deferred refold); let it lapse.
+            ...(cacheAware
+              ? { shouldRefresh: () => !(cacheAwareFramework?.isRefoldDeferred?.(agentName) ?? false) }
+              : {}),
+            onEvent: (event: Parameters<typeof logKeepaliveEvent>[0]) => {
+              logKeepaliveEvent(event);
+              if (event.type === 'refreshed') promptCacheClock.noteRefresh();
+            },
           },
         },
         llmLogPath,
         () => settingsModule.getReasoning(),
-        (record) => callLedger!.record(record),
+        (record) => {
+          callLedger!.record(record);
+          promptCacheClock.noteCall(record);
+        },
       );
 
   // Session management — resolved before Membrane construction so the
@@ -1297,6 +1319,13 @@ async function main() {
 
   const storePath = sessionManager.getStorePath(activeSession.id);
   const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter);
+  const wirePromptCache = (fw: typeof framework): void => {
+    if (!cacheAware) return;
+    cacheAwareFramework = fw as unknown as { isRefoldDeferred?: (name: string) => boolean };
+    (fw as unknown as { setPromptCacheProbe?: (p: () => 'cold' | 'warm' | undefined) => void })
+      .setPromptCacheProbe?.(() => promptCacheClock.state());
+  };
+  wirePromptCache(framework);
 
   // Build app context
   const app: AppContext = {
@@ -1321,6 +1350,7 @@ async function main() {
       // AND the user switches between imports that used different
       // --agent values; not the canonical flow.
       this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter);
+      wirePromptCache(this.framework);
       this.framework.start();
       this.userMessageCount = 0;
       resetBranchState(this.branchState);

@@ -46,6 +46,7 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'adaptiveResolution',
   'kvStableReachTokens',
   'kvStableQualityGapRatio',
+  'kvStableCacheAware',
   'compressionSlackRatio',
   'overBudgetGraceRatio',
   'foldingStrategy',
