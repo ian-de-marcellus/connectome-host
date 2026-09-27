@@ -673,6 +673,8 @@ export interface RecipeModules {
     /** Permit an individual project-shell call to use timeout_mode="none". */
     allowNoTimeout?: boolean;
     maxOutputChars?: number;
+    /** Network for commands: 'none' (default), 'loopback' (this machine only), or 'full'. */
+    network?: 'none' | 'loopback' | 'full';
   };
   /**
    * Small public-web fetcher. OPT-IN. Accepts HTTPS GETs only, rejects
@@ -2274,6 +2276,9 @@ export function validateRecipe(raw: unknown): Recipe {
         }
       }
       projectShellRootNames = names;
+      if (shell.network !== undefined && !['none', 'loopback', 'full'].includes(shell.network as string)) {
+        throw new Error("modules.projectShell.network must be 'none', 'loopback' or 'full'.");
+      }
       if (shell.readOnlyPaths !== undefined) {
         if (!Array.isArray(shell.readOnlyPaths)) {
           throw new Error('modules.projectShell.readOnlyPaths must be an array.');

@@ -242,6 +242,7 @@ export async function createFramework(
       timeoutMs: modules.projectShell.timeoutMs,
       allowNoTimeout: modules.projectShell.allowNoTimeout,
       maxOutputChars: modules.projectShell.maxOutputChars,
+      network: modules.projectShell.network,
     }));
   }
 

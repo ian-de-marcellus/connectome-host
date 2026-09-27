@@ -37,6 +37,15 @@ export interface ProjectShellModuleConfig {
    *  never modify. This keeps application bundles available without making
    *  all of /Applications visible to the resident. */
   readOnlyPaths?: string[];
+  /**
+   * Network access for commands. 'none' (default) denies all networking;
+   * 'loopback' allows only this machine (e.g. residents' health and debug
+   * endpoints); 'full' allows outbound access (git, package installs). The
+   * filesystem sandbox is unchanged in every mode. For a maintainer, whose
+   * work needs git and installs, 'full' belongs with an OS-level sandbox
+   * user that already limits what the process can touch.
+   */
+  network?: 'none' | 'loopback' | 'full';
   timeoutMs?: number;
   /** Allow the resident to opt an individual command out of the deadline.
    *  Defaults to false. This is intentionally separate from timeoutMs so a
@@ -86,6 +95,7 @@ export class ProjectShellModule implements Module {
   private readonly roots: Array<ProjectShellRoot & { excludedPaths: string[] }>;
   private scratchPath: string;
   private readonly readOnlyPaths: string[];
+  private readonly network: 'none' | 'loopback' | 'full';
   private readonly timeoutMs: number;
   private readonly allowNoTimeout: boolean;
   private readonly maxOutputChars: number;
@@ -99,6 +109,7 @@ export class ProjectShellModule implements Module {
     }));
     this.scratchPath = resolve(config.scratchPath);
     this.readOnlyPaths = (config.readOnlyPaths ?? []).map((path) => resolve(path));
+    this.network = config.network === 'loopback' || config.network === 'full' ? config.network : 'none';
     this.timeoutMs = config.timeoutMs ?? 120_000;
     this.allowNoTimeout = config.allowNoTimeout ?? false;
     this.maxOutputChars = config.maxOutputChars ?? 80_000;
@@ -150,7 +161,7 @@ export class ProjectShellModule implements Module {
           'Run a bash command inside one explicitly mounted project root. Child commands inherit a ' +
           'filesystem sandbox: they may write only the mounted roots and private scratch, and may also ' +
           'read and execute explicitly configured tool runtimes, ' +
-          `and have no network access. ${deadlineDescription} Prefer reversible curation (move uncertain removals into a ` +
+          `and ${this.describeNetwork()}. ${deadlineDescription} Prefer reversible curation (move uncertain removals into a ` +
           'clearly named holding/trash folder); do not delete or overwrite valuable material without ' +
           `Ian's explicit authorization. Available roots: ${roots}`,
         inputSchema: {
@@ -190,7 +201,7 @@ export class ProjectShellModule implements Module {
           name: root.name,
           path: root.path,
           description: root.description ?? null,
-          access: 'read-write, command-capable, no network',
+          access: `read-write, command-capable, ${this.network === 'none' ? 'no network' : this.network === 'loopback' ? 'this machine only' : 'network'}`,
           commandTimeout: {
             defaultMs: this.timeoutMs,
             defaultHuman: this.describeDuration(this.timeoutMs),
@@ -259,10 +270,33 @@ export class ProjectShellModule implements Module {
     return {};
   }
 
+  private describeNetwork(): string {
+    return this.network === 'full'
+      ? 'have network access'
+      : this.network === 'loopback'
+        ? 'have network access to this machine only (localhost)'
+        : 'have no network access';
+  }
+
+  /** Seatbelt network rules for the configured mode. */
+  private networkRules(): string[] {
+    if (this.network === 'full') return ['(allow network*)'];
+    if (this.network === 'loopback') {
+      return ['(deny network*)', '(allow network-outbound (remote ip "localhost:*"))'];
+    }
+    return ['(deny network*)'];
+  }
+
+  /** Read-only system files that networking itself needs (TLS config and
+   *  certificates, name resolution); readable only when networking is on. */
+  private static readonly NETWORK_SUPPORT_PATHS = ['/private/etc/ssl', '/etc/ssl'];
+  private static readonly NETWORK_SUPPORT_FILES = ['/private/etc/hosts', '/private/etc/resolv.conf', '/private/etc/services', '/private/etc/protocols'];
+
   private sandboxProfile(): string {
     const readableExecutables = ['/bin', '/usr/bin', '/usr/local', '/opt/homebrew'];
     const readablePaths = [
       ...readableExecutables,
+      ...(this.network === 'none' ? [] : ProjectShellModule.NETWORK_SUPPORT_PATHS),
       ...this.readOnlyPaths,
       ...this.roots.map((root) => root.path),
       this.scratchPath,
@@ -282,11 +316,14 @@ export class ProjectShellModule implements Module {
       '(version 1)',
       '(deny default)',
       '(import "system.sb")',
-      '(deny network*)',
+      ...this.networkRules(),
       '(allow process-exec)',
       '(allow process-fork)',
       `(allow file-read-metadata ${ancestorRules})`,
       `(allow file-read* file-test-existence file-map-executable ${readRules})`,
+      ...(this.network === 'none' ? [] : [
+        `(allow file-read* ${ProjectShellModule.NETWORK_SUPPORT_FILES.map((f) => `(literal ${sbQuote(f)})`).join(' ')})`,
+      ]),
       `(allow file-write* ${writeRules})`,
       ...denyRules,
     ].join('');
